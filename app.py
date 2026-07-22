@@ -42,7 +42,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 FRIEND_CHAT_ID = os.environ.get("FRIEND_CHAT_ID", "")
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.5-flash"
 GEMINI_API = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 DB_PATH = os.path.join(os.path.dirname(__file__), "fitness.db")
