@@ -167,12 +167,12 @@ def analyze_food_image(image_bytes: bytes, media_type: str) -> dict:
     )
     result = r.json()
     if r.status_code != 200:
-        print(f"GEMINI ERROR {r.status_code}: {result}")  # shows up in Render's Logs tab
+        print(f"GEMINI ERROR {r.status_code}: {result}", flush=True)
         return {"food": f"API error {r.status_code}", "calories": 0, "carbs": 0, "protein": 0, "fat": 0, "confidence": "low"}
     try:
         raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError):
-        print(f"GEMINI UNEXPECTED RESPONSE: {result}")  # shows up in Render's Logs tab
+        print(f"GEMINI UNEXPECTED RESPONSE: {result}", flush=True)
         return {"food": "unrecognized", "calories": 0, "carbs": 0, "protein": 0, "fat": 0, "confidence": "low"}
 
     raw_text = raw_text.strip().removeprefix("```json").removesuffix("```").strip()
@@ -186,31 +186,39 @@ def analyze_food_image(image_bytes: bytes, media_type: str) -> dict:
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(silent=True) or {}
+    print(f"INCOMING UPDATE: {update}", flush=True)
 
     # Case 1: photo message
     if "message" in update and "photo" in update["message"]:
         chat_id = update["message"]["chat"]["id"]
-        # Telegram sends multiple resolutions; the last one is highest quality
-        file_id = update["message"]["photo"][-1]["file_id"]
-        image_bytes, mime_type = download_telegram_photo(file_id)
-        result = analyze_food_image(image_bytes, mime_type)
+        try:
+            # Telegram sends multiple resolutions; the last one is highest quality
+            file_id = update["message"]["photo"][-1]["file_id"]
+            print(f"Downloading photo file_id={file_id}", flush=True)
+            image_bytes, mime_type = download_telegram_photo(file_id)
+            print(f"Downloaded {len(image_bytes)} bytes, calling Gemini...", flush=True)
+            result = analyze_food_image(image_bytes, mime_type)
+            print(f"Gemini result: {result}", flush=True)
 
-        log_meal(
-            chat_id,
-            result.get("food", "unknown"),
-            result.get("calories", 0),
-            result.get("carbs", 0),
-            result.get("protein", 0),
-            result.get("fat", 0),
-            result.get("confidence", "low"),
-        )
-        send_message(
-            chat_id,
-            f"Logged: {result.get('food')}\n"
-            f"Calories: {result.get('calories')} kcal\n"
-            f"Carbs: {result.get('carbs')}g | Protein: {result.get('protein')}g | Fat: {result.get('fat')}g\n"
-            f"Confidence: {result.get('confidence')}",
-        )
+            log_meal(
+                chat_id,
+                result.get("food", "unknown"),
+                result.get("calories", 0),
+                result.get("carbs", 0),
+                result.get("protein", 0),
+                result.get("fat", 0),
+                result.get("confidence", "low"),
+            )
+            send_message(
+                chat_id,
+                f"Logged: {result.get('food')}\n"
+                f"Calories: {result.get('calories')} kcal\n"
+                f"Carbs: {result.get('carbs')}g | Protein: {result.get('protein')}g | Fat: {result.get('fat')}g\n"
+                f"Confidence: {result.get('confidence')}",
+            )
+        except Exception as e:
+            print(f"PHOTO HANDLING FAILED: {type(e).__name__}: {e}", flush=True)
+            send_message(chat_id, f"Something went wrong analyzing that photo: {e}")
         return jsonify(ok=True)
 
     # Case 2: plain text (e.g. first "hi" message, or anything not a photo/button)
