@@ -32,7 +32,8 @@ load_dotenv()
 # ---------- CONFIG ----------
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-FRIEND_CHAT_ID = os.environ.get("FRIEND_CHAT_ID", "")
+# FRIEND_CHAT_ID supports multiple users: comma-separated, e.g. "123456,789012"
+FRIEND_CHAT_IDS = [c.strip() for c in os.environ.get("FRIEND_CHAT_ID", "").split(",") if c.strip()]
 
 GEMINI_MODEL = "gemini-3.5-flash"
 GEMINI_API = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
@@ -620,6 +621,10 @@ def webhook():
         text = update["message"]["text"].strip()
         state = get_state(chat_id)
 
+        if text.lower() in {"/myid", "myid"}:
+            send_message(chat_id, f"Your chat ID, sir: {chat_id}")
+            return jsonify(ok=True)
+
         if text.lower() in GREETING_WORDS:
             set_state(chat_id, state="", pending_food_type="")
             show_menu(chat_id)
@@ -768,56 +773,53 @@ def webhook():
     return jsonify(ok=True)
 
 
-# ---------- TRIGGERS (cron-job.org) ----------
+# ---------- TRIGGERS (cron-job.org) — each fires for ALL registered users ----------
+def _for_all_users(fn):
+    if not FRIEND_CHAT_IDS:
+        return jsonify(status="no chat ids set"), 400
+    for cid in FRIEND_CHAT_IDS:
+        try:
+            fn(cid)
+        except Exception as e:
+            print(f"TRIGGER FAILED for {cid}: {type(e).__name__}: {e}", flush=True)
+    return jsonify(status="sent", users=len(FRIEND_CHAT_IDS)), 200
+
+
 @app.route("/trigger/daily-prompt", methods=["GET", "POST"])
 def trigger_daily_prompt():
-    if not FRIEND_CHAT_ID:
-        return jsonify(status="no chat id set"), 400
-    send_message(FRIEND_CHAT_ID, DAILY_PROMPT_TEXT, buttons=DURATION_OPTIONS)
-    return jsonify(status="sent"), 200
+    return _for_all_users(lambda cid: send_message(cid, DAILY_PROMPT_TEXT, buttons=DURATION_OPTIONS))
 
 
 @app.route("/trigger/daily-report", methods=["GET", "POST"])
 def trigger_daily_report():
-    if not FRIEND_CHAT_ID:
-        return jsonify(status="no chat id set"), 400
-    send_daily_report(FRIEND_CHAT_ID)
-    return jsonify(status="sent"), 200
+    return _for_all_users(send_daily_report)
 
 
 @app.route("/trigger/water-reminder", methods=["GET", "POST"])
 def trigger_water_reminder():
-    if not FRIEND_CHAT_ID:
-        return jsonify(status="no chat id set"), 400
-    send_water_reminder(FRIEND_CHAT_ID)
-    return jsonify(status="sent"), 200
+    return _for_all_users(send_water_reminder)
+
+
+def _send_weight_reminder(cid):
+    set_state(cid, state="awaiting_weight")
+    send_message(cid,
+                 "⚖️ Morning weigh-in, sir. For consistency: after waking, after the bathroom, "
+                 "before food or drink.\n\nReply with your weight in kg (just the number).")
 
 
 @app.route("/trigger/weight-reminder", methods=["GET", "POST"])
 def trigger_weight_reminder():
-    if not FRIEND_CHAT_ID:
-        return jsonify(status="no chat id set"), 400
-    set_state(FRIEND_CHAT_ID, state="awaiting_weight")
-    send_message(FRIEND_CHAT_ID,
-                 "⚖️ Morning weigh-in, sir. For consistency: after waking, after the bathroom, "
-                 "before food or drink.\n\nReply with your weight in kg (just the number).")
-    return jsonify(status="sent"), 200
+    return _for_all_users(_send_weight_reminder)
 
 
 @app.route("/trigger/weekly-report", methods=["GET", "POST"])
 def trigger_weekly_report():
-    if not FRIEND_CHAT_ID:
-        return jsonify(status="no chat id set"), 400
-    send_weekly_report(FRIEND_CHAT_ID)
-    return jsonify(status="sent"), 200
+    return _for_all_users(send_weekly_report)
 
 
 @app.route("/trigger/monthly-report", methods=["GET", "POST"])
 def trigger_monthly_report():
-    if not FRIEND_CHAT_ID:
-        return jsonify(status="no chat id set"), 400
-    send_monthly_report(FRIEND_CHAT_ID)
-    return jsonify(status="sent"), 200
+    return _for_all_users(send_monthly_report)
 
 
 @app.route("/", methods=["GET"])
