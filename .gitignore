@@ -1,0 +1,4 @@
+.env
+fitness.db
+__pycache__/
+*.pyc
