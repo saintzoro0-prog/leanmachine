@@ -42,7 +42,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 FRIEND_CHAT_ID = os.environ.get("FRIEND_CHAT_ID", "")
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_API = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 DB_PATH = os.path.join(os.path.dirname(__file__), "fitness.db")
@@ -166,9 +166,13 @@ def analyze_food_image(image_bytes: bytes, media_type: str) -> dict:
         json=payload,
     )
     result = r.json()
+    if r.status_code != 200:
+        print(f"GEMINI ERROR {r.status_code}: {result}")  # shows up in Render's Logs tab
+        return {"food": f"API error {r.status_code}", "calories": 0, "carbs": 0, "protein": 0, "fat": 0, "confidence": "low"}
     try:
         raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError):
+        print(f"GEMINI UNEXPECTED RESPONSE: {result}")  # shows up in Render's Logs tab
         return {"food": "unrecognized", "calories": 0, "carbs": 0, "protein": 0, "fat": 0, "confidence": "low"}
 
     raw_text = raw_text.strip().removeprefix("```json").removesuffix("```").strip()
