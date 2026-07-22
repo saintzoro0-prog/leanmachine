@@ -29,7 +29,7 @@ import os
 import sqlite3
 import base64
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from flask import Flask, request, jsonify
@@ -108,7 +108,7 @@ def log_meal(chat_id, food, calories, carbs, protein, fat, confidence):
     conn.execute(
         "INSERT INTO meals (chat_id, timestamp, food, calories, carbs, protein, fat, confidence) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (str(chat_id), datetime.utcnow().isoformat(), food, calories, carbs, protein, fat, confidence),
+        (str(chat_id), datetime.now(timezone.utc).isoformat(), food, calories, carbs, protein, fat, confidence),
     )
     conn.commit()
     conn.close()
@@ -118,7 +118,7 @@ def log_workout(chat_id, duration, target):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "INSERT INTO workouts (chat_id, timestamp, duration, target) VALUES (?, ?, ?, ?)",
-        (str(chat_id), datetime.utcnow().isoformat(), duration, target),
+        (str(chat_id), datetime.now(timezone.utc).isoformat(), duration, target),
     )
     conn.commit()
     conn.close()
@@ -151,6 +151,8 @@ def download_telegram_photo(file_id: str):
 
 # ---------- GEMINI VISION: FOOD ANALYSIS (free, no card) ----------
 def analyze_food_image(image_bytes: bytes, media_type: str) -> dict:
+    import time
+
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
         "contents": [{
@@ -160,26 +162,39 @@ def analyze_food_image(image_bytes: bytes, media_type: str) -> dict:
             ]
         }]
     }
-    r = requests.post(
-        GEMINI_API,
-        headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-        json=payload,
-    )
-    result = r.json()
-    if r.status_code != 200:
-        print(f"GEMINI ERROR {r.status_code}: {result}", flush=True)
-        return {"food": f"API error {r.status_code}", "calories": 0, "carbs": 0, "protein": 0, "fat": 0, "confidence": "low"}
-    try:
-        raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        print(f"GEMINI UNEXPECTED RESPONSE: {result}", flush=True)
-        return {"food": "unrecognized", "calories": 0, "carbs": 0, "protein": 0, "fat": 0, "confidence": "low"}
 
-    raw_text = raw_text.strip().removeprefix("```json").removesuffix("```").strip()
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        return {"food": "unrecognized", "calories": 0, "carbs": 0, "protein": 0, "fat": 0, "confidence": "low"}
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        r = requests.post(
+            GEMINI_API,
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        )
+        result = r.json()
+
+        if r.status_code == 503 and attempt < max_attempts:
+            wait = attempt * 2  # 2s, then 4s
+            print(f"GEMINI 503 (attempt {attempt}/{max_attempts}), retrying in {wait}s...", flush=True)
+            time.sleep(wait)
+            continue
+
+        if r.status_code != 200:
+            print(f"GEMINI ERROR {r.status_code}: {result}", flush=True)
+            return {"food": f"API error {r.status_code}", "calories": 0, "carbs": 0, "protein": 0, "fat": 0, "confidence": "low"}
+
+        try:
+            raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError):
+            print(f"GEMINI UNEXPECTED RESPONSE: {result}", flush=True)
+            return {"food": "unrecognized", "calories": 0, "carbs": 0, "protein": 0, "fat": 0, "confidence": "low"}
+
+        raw_text = raw_text.strip().removeprefix("```json").removesuffix("```").strip()
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            return {"food": "unrecognized", "calories": 0, "carbs": 0, "protein": 0, "fat": 0, "confidence": "low"}
+
+    return {"food": "Gemini busy, try again", "calories": 0, "carbs": 0, "protein": 0, "fat": 0, "confidence": "low"}
 
 
 # ---------- WEBHOOK: INCOMING TELEGRAM UPDATES ----------
@@ -261,7 +276,7 @@ def trigger_weekly_report():
     if not FRIEND_CHAT_ID:
         return jsonify(status="no chat id set"), 400
     conn = sqlite3.connect(DB_PATH)
-    week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     meals = conn.execute(
         "SELECT calories, carbs, protein, fat FROM meals WHERE chat_id = ? AND timestamp >= ?",
         (str(FRIEND_CHAT_ID), week_ago),
