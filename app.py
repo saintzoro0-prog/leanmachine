@@ -34,6 +34,8 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 # FRIEND_CHAT_ID supports multiple users: comma-separated, e.g. "123456,789012"
 FRIEND_CHAT_IDS = [c.strip() for c in os.environ.get("FRIEND_CHAT_ID", "").split(",") if c.strip()]
+# Optional simple auth for the /shortcut/* endpoints (set any secret string on Render)
+SHORTCUT_TOKEN = os.environ.get("SHORTCUT_TOKEN", "")
 
 GEMINI_MODEL = "gemini-3.5-flash"
 GEMINI_API = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
@@ -47,6 +49,10 @@ PERSONA_NAME = "Jarvis"
 PERSONA_STYLE = (
     "You are a courteous, dry-witted British AI butler assisting with a fitness goal of defined abs. "
     "Address the user as 'sir'. Be concise, encouraging, lightly witty, never preachy. "
+    "Ground every claim in concrete numbers and real physiology — actual kcal figures, protein in grams "
+    "(target 1.6–2.2 g per kg bodyweight for muscle retention in a deficit), fibre and satiety, energy density, "
+    "sensible fat-loss pace (~0.5% of bodyweight per week). Simple words, real science, no vague filler like "
+    "'eat healthy' or 'stay balanced'. "
 )
 
 MENU_TEXT = "At your service, sir. What shall it be?"
@@ -59,6 +65,10 @@ MENU_BUTTONS_ROW2 = [
     {"text": "👤 Profile", "callback_data": "menu_profile"},
 ]
 MENU_BUTTONS_ROW3 = [
+    {"text": "🍳 Hungry", "callback_data": "menu_hungry"},
+    {"text": "🧠 Body Insights", "callback_data": "menu_insights"},
+]
+MENU_BUTTONS_ROW4 = [
     {"text": "💧 Log Water +500ml", "callback_data": "water_500"},
     {"text": "🧪 Demo", "callback_data": "menu_demo"},
 ]
@@ -586,9 +596,175 @@ def reset_user_data(chat_id):
     conn.close()
 
 
+# ---------- HUNGRY: simple meal suggestions ----------
+def calories_today(chat_id) -> float:
+    conn = db()
+    row = conn.execute(
+        "SELECT COALESCE(SUM(calories), 0) AS total FROM meals WHERE chat_id = ? AND timestamp >= ?",
+        (str(chat_id), today_start_iso()),
+    ).fetchone()
+    conn.close()
+    return float(row["total"])
+
+
+def hungry_reply(chat_id, user_text=None) -> str:
+    maintenance, deficit_target, _ = compute_targets(chat_id)
+    eaten = calories_today(chat_id)
+    if deficit_target:
+        budget_line = (
+            f"Today so far: {eaten:.0f} kcal eaten. Daily target: {deficit_target} kcal. "
+            f"Remaining budget: {max(deficit_target - eaten, 0):.0f} kcal."
+        )
+    else:
+        budget_line = f"Today so far: {eaten:.0f} kcal eaten. (No profile yet, so no target — suggest ~500-700 kcal meals.)"
+
+    profile = get_profile(chat_id)
+    weight = latest_weight(chat_id)
+    protein_line = ""
+    if weight:
+        protein_line = f"His daily protein target is roughly {int(weight * 1.8)} g (1.8 g/kg at {weight:.0f} kg). "
+
+    request_line = (
+        f"The user's specific request: \"{user_text}\". " if user_text
+        else "No specific request — offer 2-3 options. "
+    )
+
+    prompt = (
+        f"{PERSONA_STYLE}"
+        "The user is hungry and wants SIMPLE meal ideas that a home cook/house help can prepare with "
+        "everyday ingredients — nothing fancy, max 5-6 ingredients, common pantry items. "
+        f"{budget_line} {protein_line}{request_line}"
+        "Give 2-3 concrete options, each with: name, one-line how-to, approximate kcal and protein grams. "
+        "Prioritize high protein and high satiety within the remaining budget. "
+        "Plain text, max 130 words. End by inviting a follow-up (e.g. 'fancy something else, sir?')."
+    )
+    return call_gemini([{"text": prompt}]) or "The kitchen brain is momentarily offline, sir. Try again shortly."
+
+
+# ---------- BODY INSIGHTS: learn from the data ----------
+def send_body_insights(chat_id):
+    conn = db()
+    month_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    weights = conn.execute(
+        "SELECT weight_kg, timestamp FROM weights WHERE chat_id = ? AND timestamp >= ? ORDER BY timestamp",
+        (str(chat_id), month_ago),
+    ).fetchall()
+    meals = conn.execute(
+        "SELECT calories, protein, timestamp FROM meals WHERE chat_id = ? AND timestamp >= ?",
+        (str(chat_id), month_ago),
+    ).fetchall()
+    workouts = conn.execute(
+        "SELECT duration, target, timestamp FROM workouts WHERE chat_id = ? AND timestamp >= ?",
+        (str(chat_id), month_ago),
+    ).fetchall()
+    conn.close()
+
+    maintenance, deficit_target, _ = compute_targets(chat_id)
+
+    if len(weights) < 2 or not meals:
+        send_message(chat_id,
+                     "🧠 Body Insights needs more data, sir — at least two weigh-ins and some logged meals. "
+                     "Keep logging for a week or two and I'll have real numbers for you.")
+        return
+
+    first_w, last_w = weights[0], weights[-1]
+    days = max((datetime.fromisoformat(last_w["timestamp"]) - datetime.fromisoformat(first_w["timestamp"])).days, 1)
+    weight_change = last_w["weight_kg"] - first_w["weight_kg"]
+
+    # distinct days with logged food
+    meal_days = len({m["timestamp"][:10] for m in meals})
+    avg_intake = sum(m["calories"] for m in meals) / max(meal_days, 1)
+    avg_protein = sum(m["protein"] for m in meals) / max(meal_days, 1)
+
+    # Estimated ACTUAL maintenance from observed data: intake minus the energy equivalent of weight change
+    # (7700 kcal ≈ 1 kg of body tissue)
+    est_tdee = avg_intake - (weight_change * 7700 / days)
+
+    workout_count = len([w for w in workouts if w["duration"] and w["duration"] != "0"])
+
+    stats = (
+        f"Period: last {days} days\n"
+        f"Weight: {first_w['weight_kg']:.1f} → {last_w['weight_kg']:.1f} kg "
+        f"({'+' if weight_change >= 0 else ''}{weight_change:.1f} kg)\n"
+        f"Avg intake on logged days: {avg_intake:.0f} kcal | Avg protein: {avg_protein:.0f} g\n"
+        f"Estimated ACTUAL maintenance from your data: ~{est_tdee:.0f} kcal/day\n"
+        f"(Formula estimate was ~{maintenance} kcal)\n"
+        f"Workouts logged: {workout_count}\n"
+    )
+
+    prompt = (
+        f"{PERSONA_STYLE}"
+        f"Here are the user's measured body statistics:\n{stats}\n"
+        "Explain in max 130 words what this data says about HIS body specifically: "
+        "how his real-world maintenance compares to the formula, whether his current pace of change is "
+        "sensible for revealing abs (~0.5% bodyweight/week is the sustainable benchmark), whether his protein "
+        "is sufficient for muscle retention, and ONE concrete adjustment. Plain text, concrete numbers."
+    )
+    analysis = call_gemini([{"text": prompt}])
+    if not analysis:
+        analysis = "Analysis engine unavailable — but the raw numbers above stand on their own, sir."
+    send_message(chat_id, f"🧠 Body Insights\n\n{stats}\n{analysis}")
+
+
+# ---------- VOICE NOTES: log meals/workouts by speaking ----------
+VOICE_EXTRACT_PROMPT = (
+    "Listen to this voice note. The speaker is reporting either food they ate, a workout they did, or both. "
+    "Extract the information and respond ONLY with valid JSON, no other text, no markdown fences:\n"
+    '{"items": [\n'
+    '  {"kind": "food", "food_type": "meal|snack|drink", "food": "description", '
+    '"calories": number, "carbs": number, "protein": number, "fat": number, "confidence": "low|medium|high"},\n'
+    '  {"kind": "workout", "duration": "minutes as string", "target": "Abs|Full body|Cardio|Rest day"}\n'
+    "]}\n"
+    "Include one entry per distinct thing mentioned. Estimate nutrition from the description. "
+    'If the audio contains neither food nor workout info, return {"items": []}.'
+)
+
+
+def process_voice_note(chat_id, audio_bytes, mime_type):
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    raw = call_gemini([
+        {"text": VOICE_EXTRACT_PROMPT},
+        {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
+    ])
+    if not raw:
+        send_message(chat_id, "I couldn't process that voice note, sir. Do try once more.")
+        return
+    raw = raw.strip().removeprefix("```json").removesuffix("```").strip()
+    try:
+        data = json.loads(raw)
+        items = data.get("items", [])
+    except json.JSONDecodeError:
+        send_message(chat_id, "I heard you, sir, but couldn't structure it. Try stating it plainly, e.g. "
+                              "\"I had two eggs and toast, and did 30 minutes of abs.\"")
+        return
+
+    if not items:
+        send_message(chat_id, "Nothing loggable detected in that note, sir. Mention what you ate or how you trained.")
+        return
+
+    replies = []
+    for item in items:
+        if item.get("kind") == "food":
+            result = {"food": item.get("food", "unknown"), "calories": item.get("calories", 0),
+                      "carbs": item.get("carbs", 0), "protein": item.get("protein", 0),
+                      "fat": item.get("fat", 0), "confidence": item.get("confidence", "low")}
+            ftype = item.get("food_type", "meal")
+            meal_id = log_meal(chat_id, ftype, result)
+            set_state(chat_id, state="can_correct", last_meal_id=meal_id)
+            replies.append(f"🍽 {ftype}: {result['food']} — {result['calories']:.0f} kcal, "
+                           f"{result['protein']:.0f}g protein")
+        elif item.get("kind") == "workout":
+            log_workout(chat_id, item.get("duration", ""), item.get("target", ""))
+            replies.append(f"💪 workout: {item.get('duration', '?')} min, {item.get('target', '?')}")
+
+    send_message(chat_id, "Logged from your voice note, sir:\n" + "\n".join(replies) +
+                          "\n\n(If any food estimate is off, reply with a correction.)")
+
+
 # ---------- MENU ----------
 def show_menu(chat_id):
-    send_message(chat_id, MENU_TEXT, button_rows=[MENU_BUTTONS, MENU_BUTTONS_ROW2, MENU_BUTTONS_ROW3])
+    send_message(chat_id, MENU_TEXT,
+                 button_rows=[MENU_BUTTONS, MENU_BUTTONS_ROW2, MENU_BUTTONS_ROW3, MENU_BUTTONS_ROW4])
 
 
 # ---------- WEBHOOK ----------
@@ -596,6 +772,20 @@ def show_menu(chat_id):
 def webhook():
     update = request.get_json(silent=True) or {}
     print(f"INCOMING UPDATE: {update}", flush=True)
+
+    # ----- Voice note -----
+    if "message" in update and ("voice" in update["message"] or "audio" in update["message"]):
+        chat_id = update["message"]["chat"]["id"]
+        try:
+            media = update["message"].get("voice") or update["message"].get("audio")
+            file_id = media["file_id"]
+            mime_type = media.get("mime_type", "audio/ogg")
+            audio_bytes, _ = download_telegram_photo(file_id)  # same download mechanism works for any file
+            process_voice_note(chat_id, audio_bytes, mime_type)
+        except Exception as e:
+            print(f"VOICE HANDLING FAILED: {type(e).__name__}: {e}", flush=True)
+            send_message(chat_id, f"My apologies, sir — that voice note defeated me: {e}")
+        return jsonify(ok=True)
 
     # ----- Photo -----
     if "message" in update and "photo" in update["message"]:
@@ -678,6 +868,12 @@ def webhook():
                 send_message(chat_id, "Just the number please, sir — e.g. 72.5")
             return jsonify(ok=True)
 
+        # Hungry chat: follow-up requests for meal ideas
+        if state.get("state") == "hungry_chat":
+            reply = hungry_reply(chat_id, user_text=text)
+            send_message(chat_id, reply)
+            return jsonify(ok=True)
+
         if state.get("state") == "can_correct" and state.get("last_meal_id"):
             conn = db()
             row = conn.execute("SELECT * FROM meals WHERE id = ?", (state["last_meal_id"],)).fetchone()
@@ -712,6 +908,13 @@ def webhook():
         elif data == "menu_profile":
             set_state(chat_id, state="awaiting_age")
             send_message(chat_id, "Profile setup, sir. How old are you?")
+        elif data == "menu_hungry":
+            set_state(chat_id, state="hungry_chat", pending_food_type="")
+            send_message(chat_id, "One moment, sir — consulting the pantry and your calorie ledger...")
+            send_message(chat_id, hungry_reply(chat_id))
+        elif data == "menu_insights":
+            send_message(chat_id, "Crunching your numbers, sir...")
+            send_body_insights(chat_id)
         elif data == "menu_demo":
             send_message(chat_id, DEMO_TEXT, button_rows=[DEMO_BUTTONS, DEMO_BUTTONS_ROW2, DEMO_BUTTONS_ROW3])
         elif data.startswith("ft_"):
@@ -825,6 +1028,58 @@ def trigger_monthly_report():
 @app.route("/", methods=["GET"])
 def health():
     return jsonify(status="alive"), 200
+
+
+# ---------- iOS SHORTCUTS ENDPOINTS (direct logging without opening Telegram) ----------
+def _shortcut_auth_ok():
+    if not SHORTCUT_TOKEN:
+        return True  # no token configured -> open (set SHORTCUT_TOKEN on Render to lock down)
+    return request.args.get("token", "") == SHORTCUT_TOKEN or request.form.get("token", "") == SHORTCUT_TOKEN
+
+
+@app.route("/shortcut/water", methods=["GET", "POST"])
+def shortcut_water():
+    """One-tap water logging from an iOS Shortcut.
+    Params: chat_id (required), ml (optional, default 500), token (if SHORTCUT_TOKEN set)."""
+    if not _shortcut_auth_ok():
+        return "Unauthorized", 401
+    chat_id = request.args.get("chat_id") or request.form.get("chat_id")
+    if not chat_id:
+        return "Missing chat_id", 400
+    ml = int(request.args.get("ml", request.form.get("ml", 500)))
+    log_water(chat_id, ml)
+    _, _, water_target = compute_targets(chat_id)
+    total = water_today(chat_id)
+    return f"💧 Logged {ml} ml. Today: {total} / {water_target} ml.", 200
+
+
+@app.route("/shortcut/meal", methods=["POST"])
+def shortcut_meal():
+    """Photo meal logging from an iOS Shortcut (Take Photo -> POST here).
+    Form fields: photo (image file, required), chat_id (required),
+    food_type (optional: meal/snack/drink), token (if SHORTCUT_TOKEN set)."""
+    if not _shortcut_auth_ok():
+        return "Unauthorized", 401
+    chat_id = request.args.get("chat_id") or request.form.get("chat_id")
+    if not chat_id:
+        return "Missing chat_id", 400
+    if "photo" not in request.files:
+        return "Missing photo file (form field name must be 'photo')", 400
+    f = request.files["photo"]
+    image_bytes = f.read()
+    mime_type = f.mimetype or "image/jpeg"
+    food_type = request.args.get("food_type", request.form.get("food_type", "meal"))
+
+    result = analyze_food_image(image_bytes, mime_type)
+    meal_id = log_meal(chat_id, food_type, result)
+    set_state(chat_id, state="can_correct", pending_food_type="", last_meal_id=meal_id)
+
+    return (
+        f"Logged ({food_type}): {result.get('food')}\n"
+        f"{result.get('calories')} kcal | {result.get('carbs')}g C | "
+        f"{result.get('protein')}g P | {result.get('fat')}g F\n"
+        f"Confidence: {result.get('confidence')}"
+    ), 200
 
 
 @app.route("/set-webhook", methods=["GET"])
