@@ -80,18 +80,45 @@ FOOD_TYPE_BUTTONS = [
     {"text": "Drink", "callback_data": "ft_drink"},
 ]
 
-DAILY_PROMPT_TEXT = "Daily check-in, sir — how long did you train today?"
+DAILY_PROMPT_TEXT = "💪 Daily check-in — how long did you train today?"
 DURATION_OPTIONS = [
-    {"text": "0 min", "callback_data": "dur_0"},
-    {"text": "15-30 min", "callback_data": "dur_15-30"},
-    {"text": "30-60 min", "callback_data": "dur_30-60"},
+    {"text": "🚫 0 min", "callback_data": "dur_0"},
+    {"text": "⏱ 15-30", "callback_data": "dur_15-30"},
+    {"text": "⏱ 30-60", "callback_data": "dur_30-60"},
+]
+DURATION_OPTIONS_ROW2 = [
+    {"text": "⏱ 60-90", "callback_data": "dur_60-90"},
+    {"text": "🔥 90+", "callback_data": "dur_90+"},
 ]
 
-TARGET_PROMPT_TEXT = "And what did we target?"
+TARGET_PROMPT_TEXT = "🎯 And what did we target?"
 TARGET_OPTIONS = [
-    {"text": "Abs/Core", "callback_data": "tgt_Abs"},
-    {"text": "Full body", "callback_data": "tgt_Full"},
-    {"text": "Rest day", "callback_data": "tgt_Rest"},
+    {"text": "🔥 Abs/Core", "callback_data": "tgt_Abs"},
+    {"text": "🫁 Chest", "callback_data": "tgt_Chest"},
+    {"text": "🔙 Back", "callback_data": "tgt_Back"},
+]
+TARGET_OPTIONS_ROW2 = [
+    {"text": "🦵 Legs", "callback_data": "tgt_Legs"},
+    {"text": "💪 Arms", "callback_data": "tgt_Arms"},
+    {"text": "🏃 Cardio", "callback_data": "tgt_Cardio"},
+]
+TARGET_OPTIONS_ROW3 = [
+    {"text": "🏋️ Full body", "callback_data": "tgt_Full body"},
+    {"text": "😴 Rest day", "callback_data": "tgt_Rest day"},
+]
+
+INTENSITY_PROMPT_TEXT = "⚡ How hard did it feel?"
+INTENSITY_OPTIONS = [
+    {"text": "😌 Easy", "callback_data": "int_Easy"},
+    {"text": "😤 Moderate", "callback_data": "int_Moderate"},
+    {"text": "🥵 Hard", "callback_data": "int_Hard"},
+]
+
+# Persistent big-button keyboard shown under the text box (bigger than inline buttons)
+REPLY_KEYBOARD = [
+    ["🍽 Log Food", "💪 Workout"],
+    ["💧 Water +500", "⚖️ Weight"],
+    ["🍳 Hungry", "📋 Menu"],
 ]
 
 SEX_BUTTONS = [
@@ -174,6 +201,7 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             chat_id TEXT PRIMARY KEY,
+            name TEXT,
             age INTEGER,
             height_cm REAL,
             start_weight_kg REAL,
@@ -186,10 +214,24 @@ def init_db():
             chat_id TEXT PRIMARY KEY,
             state TEXT,
             pending_food_type TEXT,
-            last_meal_id INTEGER
+            last_meal_id INTEGER,
+            pending_duration TEXT,
+            pending_target TEXT
         )
     """)
     conn.commit()
+    # Migrations for databases created by older versions (safe to re-run)
+    for stmt in (
+        "ALTER TABLE profiles ADD COLUMN name TEXT",
+        "ALTER TABLE workouts ADD COLUMN intensity TEXT",
+        "ALTER TABLE states ADD COLUMN pending_duration TEXT",
+        "ALTER TABLE states ADD COLUMN pending_target TEXT",
+    ):
+        try:
+            conn.execute(stmt)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.close()
 
 
@@ -209,10 +251,14 @@ def get_state(chat_id):
     conn = db()
     row = conn.execute("SELECT * FROM states WHERE chat_id = ?", (str(chat_id),)).fetchone()
     conn.close()
-    return dict(row) if row else {"chat_id": str(chat_id), "state": "", "pending_food_type": "", "last_meal_id": None}
+    if row:
+        return dict(row)
+    return {"chat_id": str(chat_id), "state": "", "pending_food_type": "",
+            "last_meal_id": None, "pending_duration": "", "pending_target": ""}
 
 
-def set_state(chat_id, state=None, pending_food_type=None, last_meal_id=None):
+def set_state(chat_id, state=None, pending_food_type=None, last_meal_id=None,
+              pending_duration=None, pending_target=None):
     cur = get_state(chat_id)
     if state is not None:
         cur["state"] = state
@@ -220,19 +266,26 @@ def set_state(chat_id, state=None, pending_food_type=None, last_meal_id=None):
         cur["pending_food_type"] = pending_food_type
     if last_meal_id is not None:
         cur["last_meal_id"] = last_meal_id
+    if pending_duration is not None:
+        cur["pending_duration"] = pending_duration
+    if pending_target is not None:
+        cur["pending_target"] = pending_target
     conn = db()
     conn.execute(
-        "INSERT INTO states (chat_id, state, pending_food_type, last_meal_id) VALUES (?, ?, ?, ?) "
+        "INSERT INTO states (chat_id, state, pending_food_type, last_meal_id, pending_duration, pending_target) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(chat_id) DO UPDATE SET state=excluded.state, "
-        "pending_food_type=excluded.pending_food_type, last_meal_id=excluded.last_meal_id",
-        (str(chat_id), cur["state"], cur["pending_food_type"], cur["last_meal_id"]),
+        "pending_food_type=excluded.pending_food_type, last_meal_id=excluded.last_meal_id, "
+        "pending_duration=excluded.pending_duration, pending_target=excluded.pending_target",
+        (str(chat_id), cur["state"], cur["pending_food_type"], cur["last_meal_id"],
+         cur.get("pending_duration", ""), cur.get("pending_target", "")),
     )
     conn.commit()
     conn.close()
 
 
 # ---------- TELEGRAM ----------
-def send_message(chat_id, text, buttons=None, button_rows=None):
+def send_message(chat_id, text, buttons=None, button_rows=None, with_keyboard=False):
     payload = {"chat_id": chat_id, "text": text}
     rows = None
     if button_rows:
@@ -241,6 +294,12 @@ def send_message(chat_id, text, buttons=None, button_rows=None):
         rows = [[{"text": b["text"], "callback_data": b["callback_data"]} for b in buttons]]
     if rows:
         payload["reply_markup"] = json.dumps({"inline_keyboard": rows})
+    elif with_keyboard:
+        payload["reply_markup"] = json.dumps({
+            "keyboard": [[{"text": t} for t in row] for row in REPLY_KEYBOARD],
+            "resize_keyboard": True,
+            "is_persistent": True,
+        })
     r = requests.post(f"{TELEGRAM_API}/sendMessage", data=payload)
     return r.json()
 
@@ -355,11 +414,11 @@ def update_meal(meal_id, result):
     conn.close()
 
 
-def log_workout(chat_id, duration, target):
+def log_workout(chat_id, duration, target, intensity=""):
     conn = db()
     conn.execute(
-        "INSERT INTO workouts (chat_id, timestamp, duration, target) VALUES (?, ?, ?, ?)",
-        (str(chat_id), now_iso(), duration, target),
+        "INSERT INTO workouts (chat_id, timestamp, duration, target, intensity) VALUES (?, ?, ?, ?, ?)",
+        (str(chat_id), now_iso(), duration, target, intensity),
     )
     conn.commit()
     conn.close()
@@ -415,6 +474,7 @@ def get_profile(chat_id):
 def save_profile(chat_id, **kwargs):
     existing = get_profile(chat_id) or {}
     merged = {
+        "name": kwargs.get("name", existing.get("name")),
         "age": kwargs.get("age", existing.get("age")),
         "height_cm": kwargs.get("height_cm", existing.get("height_cm")),
         "start_weight_kg": kwargs.get("start_weight_kg", existing.get("start_weight_kg")),
@@ -423,11 +483,12 @@ def save_profile(chat_id, **kwargs):
     }
     conn = db()
     conn.execute(
-        "INSERT INTO profiles (chat_id, age, height_cm, start_weight_kg, sex, activity) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET age=excluded.age, height_cm=excluded.height_cm, "
-        "start_weight_kg=excluded.start_weight_kg, sex=excluded.sex, activity=excluded.activity",
-        (str(chat_id), merged["age"], merged["height_cm"], merged["start_weight_kg"],
+        "INSERT INTO profiles (chat_id, name, age, height_cm, start_weight_kg, sex, activity) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET name=excluded.name, age=excluded.age, "
+        "height_cm=excluded.height_cm, start_weight_kg=excluded.start_weight_kg, "
+        "sex=excluded.sex, activity=excluded.activity",
+        (str(chat_id), merged["name"], merged["age"], merged["height_cm"], merged["start_weight_kg"],
          merged["sex"], merged["activity"]),
     )
     conn.commit()
@@ -763,8 +824,66 @@ def process_voice_note(chat_id, audio_bytes, mime_type):
 
 # ---------- MENU ----------
 def show_menu(chat_id):
-    send_message(chat_id, MENU_TEXT,
+    profile = get_profile(chat_id)
+    name = (profile or {}).get("name")
+    greeting = f"At your service, {name}. What shall it be?" if name else MENU_TEXT
+    send_message(chat_id, greeting,
                  button_rows=[MENU_BUTTONS, MENU_BUTTONS_ROW2, MENU_BUTTONS_ROW3, MENU_BUTTONS_ROW4])
+    # Attach the persistent big-button keyboard (sent separately since inline + reply can't share one message)
+    send_message(chat_id, "Quick actions below ⬇️", with_keyboard=True)
+
+
+def show_profile(chat_id):
+    profile = get_profile(chat_id)
+    if not profile or not profile.get("age"):
+        set_state(chat_id, state="awaiting_name")
+        send_message(chat_id, "👤 Profile setup, sir. First — what shall I call you?")
+        return
+    weight = latest_weight(chat_id) or profile.get("start_weight_kg")
+    maintenance, deficit_target, water_target = compute_targets(chat_id)
+    sex_label = {"m": "Male", "f": "Female"}.get(profile.get("sex"), "—")
+    act_label = {1.2: "Sedentary", 1.375: "Light", 1.55: "Moderate", 1.725: "Very active"}.get(
+        profile.get("activity"), "—")
+    text = (
+        f"👤 Profile — {profile.get('name') or 'Unnamed'}\n"
+        f"Age: {profile.get('age')} | Height: {profile.get('height_cm'):.0f} cm\n"
+        f"Start weight: {profile.get('start_weight_kg'):.1f} kg | Current: {weight:.1f} kg\n"
+        f"Sex: {sex_label} | Activity: {act_label}\n"
+    )
+    if maintenance:
+        text += (
+            f"\n🔢 Maintenance: ~{maintenance} kcal | Target: ~{deficit_target} kcal\n"
+            f"💧 Water target: ~{water_target} ml/day"
+        )
+    send_message(chat_id, text, button_rows=[
+        [{"text": "✏️ Name", "callback_data": "edit_name"},
+         {"text": "✏️ Age", "callback_data": "edit_age"},
+         {"text": "✏️ Height", "callback_data": "edit_height"}],
+        [{"text": "✏️ Activity", "callback_data": "edit_activity"},
+         {"text": "🔄 Redo full setup", "callback_data": "edit_full"}],
+    ])
+
+
+# ---------- CONVERSATIONAL FALLBACK ----------
+def chat_reply(chat_id, text) -> str:
+    profile = get_profile(chat_id) or {}
+    maintenance, deficit_target, water_target = compute_targets(chat_id)
+    eaten = calories_today(chat_id)
+    context = (
+        f"User's name: {profile.get('name') or 'unknown'}. "
+        f"Today's intake so far: {eaten:.0f} kcal. "
+        + (f"Daily target: {deficit_target} kcal, maintenance {maintenance} kcal. " if deficit_target else "")
+        + f"Water target: {water_target} ml. "
+    )
+    prompt = (
+        f"{PERSONA_STYLE}"
+        f"Context: {context}\n"
+        f"The user said: \"{text}\"\n"
+        "Reply conversationally in 1-3 short sentences maximum. If they're asking about fitness/food/their "
+        "progress, answer with concrete numbers from the context. If they want to log something, remind them "
+        "of the quick action buttons or that they can send a photo/voice note. Plain text only."
+    )
+    return call_gemini([{"text": prompt}]) or "I'm momentarily lost for words, sir. Try the 📋 Menu."
 
 
 # ---------- WEBHOOK ----------
@@ -815,6 +934,31 @@ def webhook():
             send_message(chat_id, f"Your chat ID, sir: {chat_id}")
             return jsonify(ok=True)
 
+        # Persistent keyboard quick actions
+        if text == "🍽 Log Food":
+            send_message(chat_id, FOOD_TYPE_TEXT, buttons=FOOD_TYPE_BUTTONS)
+            return jsonify(ok=True)
+        if text == "💪 Workout":
+            send_message(chat_id, DAILY_PROMPT_TEXT, button_rows=[DURATION_OPTIONS, DURATION_OPTIONS_ROW2])
+            return jsonify(ok=True)
+        if text == "💧 Water +500":
+            log_water(chat_id, 500)
+            _, _, water_target = compute_targets(chat_id)
+            send_message(chat_id, f"💧 Logged 500 ml. {water_today(chat_id)} / {water_target} ml today.")
+            return jsonify(ok=True)
+        if text == "⚖️ Weight":
+            set_state(chat_id, state="awaiting_weight")
+            send_message(chat_id, "Your weight in kg, sir (just the number, e.g. 72.5).")
+            return jsonify(ok=True)
+        if text == "🍳 Hungry":
+            set_state(chat_id, state="hungry_chat", pending_food_type="")
+            send_message(chat_id, hungry_reply(chat_id))
+            return jsonify(ok=True)
+        if text == "📋 Menu":
+            set_state(chat_id, state="", pending_food_type="")
+            show_menu(chat_id)
+            return jsonify(ok=True)
+
         if text.lower() in GREETING_WORDS:
             set_state(chat_id, state="", pending_food_type="")
             show_menu(chat_id)
@@ -834,6 +978,35 @@ def webhook():
                 send_message(chat_id, f"Weight logged, sir: {weight:.1f} kg{trend} ✅")
             except ValueError:
                 send_message(chat_id, "Just the number please, sir — e.g. 72.5")
+            return jsonify(ok=True)
+
+        if state.get("state") == "awaiting_name":
+            save_profile(chat_id, name=text[:40])
+            set_state(chat_id, state="awaiting_age")
+            send_message(chat_id, f"A pleasure, {text[:40]}. How old are you?")
+            return jsonify(ok=True)
+
+        # Single-field edits from the profile screen
+        if state.get("state") == "edit_name":
+            save_profile(chat_id, name=text[:40])
+            set_state(chat_id, state="")
+            show_profile(chat_id)
+            return jsonify(ok=True)
+        if state.get("state") == "edit_age":
+            try:
+                save_profile(chat_id, age=int(text))
+                set_state(chat_id, state="")
+                show_profile(chat_id)
+            except ValueError:
+                send_message(chat_id, "A whole number please, sir — e.g. 21")
+            return jsonify(ok=True)
+        if state.get("state") == "edit_height":
+            try:
+                save_profile(chat_id, height_cm=float(text.replace(",", ".")))
+                set_state(chat_id, state="")
+                show_profile(chat_id)
+            except ValueError:
+                send_message(chat_id, "Height in cm please, sir — e.g. 175")
             return jsonify(ok=True)
 
         if state.get("state") == "awaiting_age":
@@ -888,7 +1061,8 @@ def webhook():
                 send_message(chat_id, "I couldn't locate the last entry to amend, sir. Send 'menu' to start over.")
             return jsonify(ok=True)
 
-        send_message(chat_id, "Send 'menu' for options, sir, or a food photo to log it.")
+        # Conversational fallback — chat naturally instead of a canned line
+        send_message(chat_id, chat_reply(chat_id, text))
         return jsonify(ok=True)
 
     # ----- Button taps -----
@@ -901,13 +1075,27 @@ def webhook():
         if data == "menu_food":
             send_message(chat_id, FOOD_TYPE_TEXT, buttons=FOOD_TYPE_BUTTONS)
         elif data == "menu_workout":
-            send_message(chat_id, DAILY_PROMPT_TEXT, buttons=DURATION_OPTIONS)
+            send_message(chat_id, DAILY_PROMPT_TEXT, button_rows=[DURATION_OPTIONS, DURATION_OPTIONS_ROW2])
         elif data == "menu_weight":
             set_state(chat_id, state="awaiting_weight")
             send_message(chat_id, "Your weight in kg, sir (just the number, e.g. 72.5).")
         elif data == "menu_profile":
-            set_state(chat_id, state="awaiting_age")
-            send_message(chat_id, "Profile setup, sir. How old are you?")
+            show_profile(chat_id)
+        elif data == "edit_name":
+            set_state(chat_id, state="edit_name")
+            send_message(chat_id, "What shall I call you, sir?")
+        elif data == "edit_age":
+            set_state(chat_id, state="edit_age")
+            send_message(chat_id, "Your age?")
+        elif data == "edit_height":
+            set_state(chat_id, state="edit_height")
+            send_message(chat_id, "Your height in cm?")
+        elif data == "edit_activity":
+            send_message(chat_id, "How active are you day to day, sir?",
+                         button_rows=[ACTIVITY_BUTTONS, ACTIVITY_BUTTONS_ROW2])
+        elif data == "edit_full":
+            set_state(chat_id, state="awaiting_name")
+            send_message(chat_id, "Full setup then, sir. What shall I call you?")
         elif data == "menu_hungry":
             set_state(chat_id, state="hungry_chat", pending_food_type="")
             send_message(chat_id, "One moment, sir — consulting the pantry and your calorie ledger...")
@@ -923,12 +1111,30 @@ def webhook():
             send_message(chat_id, f"Send a photo of your {food_type}, sir 📸")
         elif data.startswith("dur_"):
             duration = data.replace("dur_", "")
-            log_workout(chat_id, duration, "")
-            send_message(chat_id, TARGET_PROMPT_TEXT, buttons=TARGET_OPTIONS)
+            if duration == "0":
+                log_workout(chat_id, "0", "Rest day", "")
+                send_message(chat_id, "A rest day then, sir. Recovery is training too.")
+            else:
+                set_state(chat_id, pending_duration=duration)
+                send_message(chat_id, TARGET_PROMPT_TEXT,
+                             button_rows=[TARGET_OPTIONS, TARGET_OPTIONS_ROW2, TARGET_OPTIONS_ROW3])
         elif data.startswith("tgt_"):
             target = data.replace("tgt_", "")
-            log_workout(chat_id, "", target)
-            send_message(chat_id, f"Logged: {target}. Well done, sir.")
+            if target == "Rest day":
+                log_workout(chat_id, get_state(chat_id).get("pending_duration", ""), target, "")
+                set_state(chat_id, pending_duration="", pending_target="")
+                send_message(chat_id, "Rest day logged, sir. Well earned, I trust.")
+            else:
+                set_state(chat_id, pending_target=target)
+                send_message(chat_id, INTENSITY_PROMPT_TEXT, buttons=INTENSITY_OPTIONS)
+        elif data.startswith("int_"):
+            intensity = data.replace("int_", "")
+            st = get_state(chat_id)
+            log_workout(chat_id, st.get("pending_duration", ""), st.get("pending_target", ""), intensity)
+            set_state(chat_id, pending_duration="", pending_target="")
+            send_message(chat_id,
+                         f"💪 Logged: {st.get('pending_duration', '?')} min {st.get('pending_target', '?')}, "
+                         f"{intensity.lower()} intensity. Well done, sir.")
         elif data.startswith("sex_"):
             save_profile(chat_id, sex=data.replace("sex_", ""))
             send_message(chat_id, "And how active are you day to day, sir?",
