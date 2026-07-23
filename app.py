@@ -54,22 +54,69 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "fitness.db")
 
 app = Flask(__name__)
 
-# ---------- DATABASE LAYER (Turso if configured, local SQLite otherwise) ----------
-_turso = None
+# ---------- DATABASE LAYER (Turso via HTTP API if configured, local SQLite otherwise) ----------
+# NOTE: we use Turso's plain HTTP "pipeline" API via `requests` instead of the libsql_client
+# package — that package is unmaintained (archived) and its websocket transport was failing.
+TURSO_HTTP_URL = TURSO_DATABASE_URL.replace("libsql://", "https://") if TURSO_DATABASE_URL else ""
+
 if USE_TURSO:
-    import libsql_client
-    _turso = libsql_client.create_client_sync(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
-    print("DB: connected to Turso (persistent)", flush=True)
+    print("DB: connected to Turso via HTTP (persistent)", flush=True)
 else:
     print("DB: local SQLite (EPHEMERAL on Render — set TURSO_* env vars for persistence)", flush=True)
+
+
+def _turso_execute(sql, params=()):
+    """Runs one SQL statement against Turso's HTTP pipeline API. Returns the raw result dict."""
+    # Turso's HTTP API wants typed args: {"type": "text"/"integer"/"float"/"null", "value": ...}
+    def wrap(v):
+        if v is None:
+            return {"type": "null"}
+        if isinstance(v, bool):
+            return {"type": "integer", "value": "1" if v else "0"}
+        if isinstance(v, int):
+            return {"type": "integer", "value": str(v)}
+        if isinstance(v, float):
+            return {"type": "float", "value": v}
+        return {"type": "text", "value": str(v)}
+
+    body = {"requests": [
+        {"type": "execute", "stmt": {"sql": sql, "args": [wrap(p) for p in params]}},
+        {"type": "close"},
+    ]}
+    r = requests.post(
+        f"{TURSO_HTTP_URL}/v2/pipeline",
+        headers={"Authorization": f"Bearer {TURSO_AUTH_TOKEN}", "Content-Type": "application/json"},
+        json=body,
+        timeout=15,
+    )
+    if r.status_code != 200:
+        print(f"TURSO HTTP ERROR {r.status_code}: {r.text}", flush=True)
+        raise RuntimeError(f"Turso error {r.status_code}: {r.text}")
+    data = r.json()
+    result_entry = data["results"][0]
+    if result_entry["type"] == "error":
+        print(f"TURSO SQL ERROR: {result_entry}", flush=True)
+        raise RuntimeError(f"Turso SQL error: {result_entry}")
+    return result_entry["response"]["result"]
 
 
 def q(sql, params=()):
     """Run a read query, return list of dicts."""
     if USE_TURSO:
-        rs = _turso.execute(sql, list(params))
-        cols = list(rs.columns)
-        return [dict(zip(cols, list(row))) for row in rs.rows]
+        result = _turso_execute(sql, params)
+        cols = [c["name"] for c in result["cols"]]
+        rows = []
+        for raw_row in result["rows"]:
+            row = {}
+            for col, cell in zip(cols, raw_row):
+                v = cell.get("value")
+                if cell.get("type") == "integer" and v is not None:
+                    v = int(v)
+                elif cell.get("type") == "float" and v is not None:
+                    v = float(v)
+                row[col] = v
+            rows.append(row)
+        return rows
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(sql, params).fetchall()
@@ -80,8 +127,8 @@ def q(sql, params=()):
 def x(sql, params=()):
     """Run a write query, return last inserted row id."""
     if USE_TURSO:
-        rs = _turso.execute(sql, list(params))
-        return rs.last_insert_rowid
+        result = _turso_execute(sql, params)
+        return result.get("last_insert_rowid")
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(sql, params)
     conn.commit()
