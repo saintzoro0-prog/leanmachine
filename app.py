@@ -40,7 +40,8 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 FRIEND_CHAT_IDS = [c.strip() for c in os.environ.get("FRIEND_CHAT_ID", "").split(",") if c.strip()]
 SHORTCUT_TOKEN = os.environ.get("SHORTCUT_TOKEN", "")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+print(f"CONFIG: ADMIN_CHAT_ID loaded as: '{ADMIN_CHAT_ID}'", flush=True)
 TZ_OFFSET_HOURS = float(os.environ.get("TZ_OFFSET_HOURS", "4"))  # Dubai = UTC+4
 
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL", "")
@@ -1012,10 +1013,12 @@ def webhook():
         state = get_state(chat_id)
 
         if text.lower() in {"/myid", "myid"}:
+            print(f"MYID requested, chat_id = '{chat_id}' (type: {type(chat_id).__name__})", flush=True)
             send_message(chat_id, f"Your chat ID, sir: {chat_id}")
             return jsonify(ok=True)
 
         if text.lower() in {"/admin", "admin"}:
+            print(f"ADMIN attempt: chat_id='{chat_id}' vs ADMIN_CHAT_ID='{ADMIN_CHAT_ID}'", flush=True)
             if ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID):
                 show_admin_user_list(chat_id)
             else:
