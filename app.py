@@ -1,19 +1,25 @@
 """
-Fitness Agent — Telegram + Gemini (free) — v3 "Jarvis edition"
-----------------------------------------------------------------
-Features:
-- Butler-style persona in all messages (name + tone editable in settings)
-- Menu (send "hi"/"menu"): Food Log | Workout | Log Weight | Profile | Demo
-- Food Log -> Meal/Snack/Drink -> photo -> AI calories/macros; reply text to correct
-- Profile: age, height, weight, sex, activity -> computes maintenance (TDEE) + deficit target
-- Daily end-of-day report (/trigger/daily-report): totals vs target + flags foods that
-  work against the abs goal
-- Water: hourly reminder (/trigger/water-reminder) with personalized daily target
-  (35 ml per kg bodyweight) and a tap-to-log +500ml button with progress
-- Weekly report (/trigger/weekly-report), Monthly habits report (/trigger/monthly-report)
-- Demo menu: fire any report instantly to yourself for testing + Reset My Data (with confirm)
+Fitness Agent — Telegram + Gemini — v4 "Persistent edition"
+--------------------------------------------------------------
+Data now lives in Turso (free hosted database) so NOTHING is lost when the
+app redeploys, restarts, or sleeps. Update app.py as often as you like —
+profiles, meals, weights, water all survive.
 
-Env vars: GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, FRIEND_CHAT_ID
+If TURSO_* env vars are not set, falls back to local SQLite (dev mode only —
+data will NOT survive redeploys on Render without Turso).
+
+New in v4:
+- Turso persistent storage
+- Correct "today" boundaries for your timezone (default UTC+4 Dubai) —
+  a meal at 11 PM now counts for the right day
+- "undo" / "/undo" command deletes the last logged food item
+
+Env vars:
+  GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, FRIEND_CHAT_ID (comma-separated)
+  TURSO_DATABASE_URL, TURSO_AUTH_TOKEN   <- the persistence fix
+  ADMIN_CHAT_ID (your /myid, unlocks /admin)
+  SHORTCUT_TOKEN (optional, locks /shortcut/* endpoints)
+  TZ_OFFSET_HOURS (optional, default 4 = Dubai)
 """
 
 import os
@@ -32,10 +38,14 @@ load_dotenv()
 # ---------- CONFIG ----------
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-# FRIEND_CHAT_ID supports multiple users: comma-separated, e.g. "123456,789012"
 FRIEND_CHAT_IDS = [c.strip() for c in os.environ.get("FRIEND_CHAT_ID", "").split(",") if c.strip()]
-# Optional simple auth for the /shortcut/* endpoints (set any secret string on Render)
 SHORTCUT_TOKEN = os.environ.get("SHORTCUT_TOKEN", "")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+TZ_OFFSET_HOURS = float(os.environ.get("TZ_OFFSET_HOURS", "4"))  # Dubai = UTC+4
+
+TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL", "")
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
+USE_TURSO = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN)
 
 GEMINI_MODEL = "gemini-3.5-flash"
 GEMINI_API = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
@@ -43,6 +53,87 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 DB_PATH = os.path.join(os.path.dirname(__file__), "fitness.db")
 
 app = Flask(__name__)
+
+# ---------- DATABASE LAYER (Turso if configured, local SQLite otherwise) ----------
+_turso = None
+if USE_TURSO:
+    import libsql_client
+    _turso = libsql_client.create_client_sync(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+    print("DB: connected to Turso (persistent)", flush=True)
+else:
+    print("DB: local SQLite (EPHEMERAL on Render — set TURSO_* env vars for persistence)", flush=True)
+
+
+def q(sql, params=()):
+    """Run a read query, return list of dicts."""
+    if USE_TURSO:
+        rs = _turso.execute(sql, list(params))
+        cols = list(rs.columns)
+        return [dict(zip(cols, list(row))) for row in rs.rows]
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def x(sql, params=()):
+    """Run a write query, return last inserted row id."""
+    if USE_TURSO:
+        rs = _turso.execute(sql, list(params))
+        return rs.last_insert_rowid
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(sql, params)
+    conn.commit()
+    rid = cur.lastrowid
+    conn.close()
+    return rid
+
+
+def init_db():
+    ddl = [
+        """CREATE TABLE IF NOT EXISTS meals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT, timestamp TEXT, food_type TEXT DEFAULT 'meal', food TEXT,
+            calories REAL, carbs REAL, protein REAL, fat REAL, confidence TEXT)""",
+        """CREATE TABLE IF NOT EXISTS workouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT, timestamp TEXT, duration TEXT, target TEXT, intensity TEXT)""",
+        """CREATE TABLE IF NOT EXISTS weights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT, timestamp TEXT, weight_kg REAL)""",
+        """CREATE TABLE IF NOT EXISTS water (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT, timestamp TEXT, ml INTEGER)""",
+        """CREATE TABLE IF NOT EXISTS profiles (
+            chat_id TEXT PRIMARY KEY, name TEXT, age INTEGER, height_cm REAL,
+            start_weight_kg REAL, sex TEXT, activity REAL)""",
+        """CREATE TABLE IF NOT EXISTS states (
+            chat_id TEXT PRIMARY KEY, state TEXT, pending_food_type TEXT,
+            last_meal_id INTEGER, pending_duration TEXT, pending_target TEXT)""",
+        """CREATE TABLE IF NOT EXISTS progress_photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT, timestamp TEXT, file_id TEXT)""",
+    ]
+    for stmt in ddl:
+        x(stmt)
+
+
+init_db()
+
+
+# ---------- TIME (timezone-aware "today") ----------
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def today_start_iso():
+    """Start of *local* day (per TZ_OFFSET_HOURS), expressed in UTC ISO for comparisons."""
+    local_now = datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)
+    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    utc_equivalent = local_midnight - timedelta(hours=TZ_OFFSET_HOURS)
+    return utc_equivalent.isoformat()
+
 
 # ---------- EDITABLE SETTINGS ----------
 PERSONA_NAME = "Jarvis"
@@ -75,9 +166,9 @@ MENU_BUTTONS_ROW4 = [
 
 FOOD_TYPE_TEXT = "Very good, sir. What are we logging?"
 FOOD_TYPE_BUTTONS = [
-    {"text": "Meal", "callback_data": "ft_meal"},
-    {"text": "Snack", "callback_data": "ft_snack"},
-    {"text": "Drink", "callback_data": "ft_drink"},
+    {"text": "🍽 Meal", "callback_data": "ft_meal"},
+    {"text": "🍿 Snack", "callback_data": "ft_snack"},
+    {"text": "🥤 Drink", "callback_data": "ft_drink"},
 ]
 
 DAILY_PROMPT_TEXT = "💪 Daily check-in — how long did you train today?"
@@ -114,45 +205,18 @@ INTENSITY_OPTIONS = [
     {"text": "🥵 Hard", "callback_data": "int_Hard"},
 ]
 
-# Persistent big-button keyboard shown under the text box (bigger than inline buttons)
 REPLY_KEYBOARD = [
     ["🍽 Log Food", "💪 Workout"],
     ["💧 Water +500", "⚖️ Weight"],
     ["🍳 Hungry", "📋 Menu"],
 ]
 
-SEX_BUTTONS = [
-    {"text": "Male", "callback_data": "sex_m"},
-    {"text": "Female", "callback_data": "sex_f"},
-]
-ACTIVITY_BUTTONS = [
-    {"text": "Sedentary", "callback_data": "act_1.2"},
-    {"text": "Light", "callback_data": "act_1.375"},
-    {"text": "Moderate", "callback_data": "act_1.55"},
-]
-ACTIVITY_BUTTONS_ROW2 = [
-    {"text": "Very active", "callback_data": "act_1.725"},
-]
-
-DEMO_TEXT = "Testing chamber, sir. Which system shall I fire?"
-DEMO_BUTTONS = [
-    {"text": "📋 Daily Report", "callback_data": "demo_daily"},
-    {"text": "💧 Water Reminder", "callback_data": "demo_water"},
-]
-DEMO_BUTTONS_ROW2 = [
-    {"text": "📊 Weekly Report", "callback_data": "demo_weekly"},
-    {"text": "📅 Monthly Report", "callback_data": "demo_monthly"},
-]
-DEMO_BUTTONS_ROW3 = [
-    {"text": "🗑 Reset My Data", "callback_data": "demo_reset"},
-]
-
 GREETING_WORDS = {"hi", "hello", "hey", "menu", "/start", "start", "yo", "jarvis"}
 
-WATER_ML_PER_KG = 35          # daily water target: 35 ml per kg bodyweight
-DEFAULT_WATER_TARGET_ML = 2500  # fallback if no weight logged
-DEFICIT_KCAL = 500            # standard moderate deficit below maintenance
-MIN_TARGET_KCAL = 1500        # never recommend eating below this
+WATER_ML_PER_KG = 35
+DEFAULT_WATER_TARGET_ML = 2500
+DEFICIT_KCAL = 500
+MIN_TARGET_KCAL = 1500
 
 FOOD_ANALYSIS_PROMPT = (
     "You are a nutrition estimation tool. Identify the food(s) in this image and "
@@ -162,97 +226,24 @@ FOOD_ANALYSIS_PROMPT = (
     '"protein": number, "fat": number, "confidence": "low|medium|high"}'
 )
 
-
-# ---------- DATABASE ----------
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = db()
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS meals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT, timestamp TEXT, food_type TEXT DEFAULT 'meal', food TEXT,
-            calories REAL, carbs REAL, protein REAL, fat REAL, confidence TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS workouts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT, timestamp TEXT, duration TEXT, target TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS weights (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT, timestamp TEXT, weight_kg REAL
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS water (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT, timestamp TEXT, ml INTEGER
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            chat_id TEXT PRIMARY KEY,
-            name TEXT,
-            age INTEGER,
-            height_cm REAL,
-            start_weight_kg REAL,
-            sex TEXT,
-            activity REAL
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS states (
-            chat_id TEXT PRIMARY KEY,
-            state TEXT,
-            pending_food_type TEXT,
-            last_meal_id INTEGER,
-            pending_duration TEXT,
-            pending_target TEXT
-        )
-    """)
-    conn.commit()
-    # Migrations for databases created by older versions (safe to re-run)
-    for stmt in (
-        "ALTER TABLE profiles ADD COLUMN name TEXT",
-        "ALTER TABLE workouts ADD COLUMN intensity TEXT",
-        "ALTER TABLE states ADD COLUMN pending_duration TEXT",
-        "ALTER TABLE states ADD COLUMN pending_target TEXT",
-    ):
-        try:
-            conn.execute(stmt)
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass  # column already exists
-    conn.close()
+VOICE_EXTRACT_PROMPT = (
+    "Listen to this voice note. The speaker is reporting either food they ate, a workout they did, or both. "
+    "Extract the information and respond ONLY with valid JSON, no other text, no markdown fences:\n"
+    '{"items": [\n'
+    '  {"kind": "food", "food_type": "meal|snack|drink", "food": "description", '
+    '"calories": number, "carbs": number, "protein": number, "fat": number, "confidence": "low|medium|high"},\n'
+    '  {"kind": "workout", "duration": "minutes as string", "target": "Abs|Chest|Back|Legs|Arms|Cardio|Full body|Rest day"}\n'
+    "]}\n"
+    "Include one entry per distinct thing mentioned. Estimate nutrition from the description. "
+    'If the audio contains neither food nor workout info, return {"items": []}.'
+)
 
 
-init_db()
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def today_start_iso():
-    now = datetime.now(timezone.utc)
-    return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-
-
+# ---------- STATE ----------
 def get_state(chat_id):
-    conn = db()
-    row = conn.execute("SELECT * FROM states WHERE chat_id = ?", (str(chat_id),)).fetchone()
-    conn.close()
-    if row:
-        return dict(row)
+    rows = q("SELECT * FROM states WHERE chat_id = ?", (str(chat_id),))
+    if rows:
+        return rows[0]
     return {"chat_id": str(chat_id), "state": "", "pending_food_type": "",
             "last_meal_id": None, "pending_duration": "", "pending_target": ""}
 
@@ -270,18 +261,13 @@ def set_state(chat_id, state=None, pending_food_type=None, last_meal_id=None,
         cur["pending_duration"] = pending_duration
     if pending_target is not None:
         cur["pending_target"] = pending_target
-    conn = db()
-    conn.execute(
-        "INSERT INTO states (chat_id, state, pending_food_type, last_meal_id, pending_duration, pending_target) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET state=excluded.state, "
-        "pending_food_type=excluded.pending_food_type, last_meal_id=excluded.last_meal_id, "
-        "pending_duration=excluded.pending_duration, pending_target=excluded.pending_target",
-        (str(chat_id), cur["state"], cur["pending_food_type"], cur["last_meal_id"],
-         cur.get("pending_duration", ""), cur.get("pending_target", "")),
-    )
-    conn.commit()
-    conn.close()
+    x("INSERT INTO states (chat_id, state, pending_food_type, last_meal_id, pending_duration, pending_target) "
+      "VALUES (?, ?, ?, ?, ?, ?) "
+      "ON CONFLICT(chat_id) DO UPDATE SET state=excluded.state, "
+      "pending_food_type=excluded.pending_food_type, last_meal_id=excluded.last_meal_id, "
+      "pending_duration=excluded.pending_duration, pending_target=excluded.pending_target",
+      (str(chat_id), cur["state"], cur["pending_food_type"], cur["last_meal_id"],
+       cur.get("pending_duration", ""), cur.get("pending_target", "")))
 
 
 # ---------- TELEGRAM ----------
@@ -308,12 +294,12 @@ def answer_callback(callback_query_id):
     requests.post(f"{TELEGRAM_API}/answerCallbackQuery", data={"callback_query_id": callback_query_id})
 
 
-def download_telegram_photo(file_id: str):
+def download_telegram_file(file_id: str):
     file_info = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}).json()
     file_path = file_info["result"]["file_path"]
     file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
     content = requests.get(file_url).content
-    return content, "image/jpeg"
+    return content
 
 
 # ---------- GEMINI ----------
@@ -383,92 +369,127 @@ def format_food_reply(result: dict, food_type: str) -> str:
         f"Calories: {result.get('calories')} kcal\n"
         f"Carbs: {result.get('carbs')}g | Protein: {result.get('protein')}g | Fat: {result.get('fat')}g\n"
         f"Confidence: {result.get('confidence')}\n\n"
-        f"If I've misjudged it, simply reply with a correction (e.g. \"they're chicken dumplings\")."
+        f"If I've misjudged it, reply with a correction — or send 'undo' to remove it."
     )
 
 
 # ---------- LOGGING ----------
 def log_meal(chat_id, food_type, result) -> int:
-    conn = db()
-    cur = conn.execute(
-        "INSERT INTO meals (chat_id, timestamp, food_type, food, calories, carbs, protein, fat, confidence) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (str(chat_id), now_iso(), food_type,
-         result.get("food", "unknown"), result.get("calories", 0), result.get("carbs", 0),
-         result.get("protein", 0), result.get("fat", 0), result.get("confidence", "low")),
-    )
-    meal_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return meal_id
+    return x("INSERT INTO meals (chat_id, timestamp, food_type, food, calories, carbs, protein, fat, confidence) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (str(chat_id), now_iso(), food_type,
+              result.get("food", "unknown"), result.get("calories", 0), result.get("carbs", 0),
+              result.get("protein", 0), result.get("fat", 0), result.get("confidence", "low")))
 
 
 def update_meal(meal_id, result):
-    conn = db()
-    conn.execute(
-        "UPDATE meals SET food=?, calories=?, carbs=?, protein=?, fat=?, confidence=? WHERE id=?",
-        (result.get("food", "unknown"), result.get("calories", 0), result.get("carbs", 0),
-         result.get("protein", 0), result.get("fat", 0), result.get("confidence", "low"), meal_id),
-    )
-    conn.commit()
-    conn.close()
+    x("UPDATE meals SET food=?, calories=?, carbs=?, protein=?, fat=?, confidence=? WHERE id=?",
+      (result.get("food", "unknown"), result.get("calories", 0), result.get("carbs", 0),
+       result.get("protein", 0), result.get("fat", 0), result.get("confidence", "low"), meal_id))
+
+
+def delete_last_meal(chat_id):
+    rows = q("SELECT id, food FROM meals WHERE chat_id = ? ORDER BY id DESC LIMIT 1", (str(chat_id),))
+    if not rows:
+        return None
+    x("DELETE FROM meals WHERE id = ?", (rows[0]["id"],))
+    return rows[0]["food"]
 
 
 def log_workout(chat_id, duration, target, intensity=""):
-    conn = db()
-    conn.execute(
-        "INSERT INTO workouts (chat_id, timestamp, duration, target, intensity) VALUES (?, ?, ?, ?, ?)",
-        (str(chat_id), now_iso(), duration, target, intensity),
-    )
-    conn.commit()
-    conn.close()
+    x("INSERT INTO workouts (chat_id, timestamp, duration, target, intensity) VALUES (?, ?, ?, ?, ?)",
+      (str(chat_id), now_iso(), duration, target, intensity))
 
 
 def log_weight(chat_id, weight_kg):
-    conn = db()
-    conn.execute(
-        "INSERT INTO weights (chat_id, timestamp, weight_kg) VALUES (?, ?, ?)",
-        (str(chat_id), now_iso(), weight_kg),
-    )
-    conn.commit()
-    conn.close()
+    x("INSERT INTO weights (chat_id, timestamp, weight_kg) VALUES (?, ?, ?)",
+      (str(chat_id), now_iso(), weight_kg))
 
 
 def latest_weight(chat_id):
-    conn = db()
-    row = conn.execute(
-        "SELECT weight_kg FROM weights WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 1",
-        (str(chat_id),),
-    ).fetchone()
-    conn.close()
-    return row["weight_kg"] if row else None
+    rows = q("SELECT weight_kg FROM weights WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 1", (str(chat_id),))
+    return rows[0]["weight_kg"] if rows else None
 
 
 def log_water(chat_id, ml):
-    conn = db()
-    conn.execute(
-        "INSERT INTO water (chat_id, timestamp, ml) VALUES (?, ?, ?)",
-        (str(chat_id), now_iso(), ml),
-    )
-    conn.commit()
-    conn.close()
+    x("INSERT INTO water (chat_id, timestamp, ml) VALUES (?, ?, ?)", (str(chat_id), now_iso(), ml))
 
 
 def water_today(chat_id) -> int:
-    conn = db()
-    row = conn.execute(
-        "SELECT COALESCE(SUM(ml), 0) AS total FROM water WHERE chat_id = ? AND timestamp >= ?",
-        (str(chat_id), today_start_iso()),
-    ).fetchone()
-    conn.close()
-    return int(row["total"])
+    rows = q("SELECT COALESCE(SUM(ml), 0) AS total FROM water WHERE chat_id = ? AND timestamp >= ?",
+             (str(chat_id), today_start_iso()))
+    return int(rows[0]["total"])
+
+
+def calories_today(chat_id) -> float:
+    rows = q("SELECT COALESCE(SUM(calories), 0) AS total FROM meals WHERE chat_id = ? AND timestamp >= ?",
+             (str(chat_id), today_start_iso()))
+    return float(rows[0]["total"])
 
 
 def get_profile(chat_id):
-    conn = db()
-    row = conn.execute("SELECT * FROM profiles WHERE chat_id = ?", (str(chat_id),)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+    rows = q("SELECT * FROM profiles WHERE chat_id = ?", (str(chat_id),))
+    return rows[0] if rows else None
+
+
+def local_date(ts_iso: str) -> str:
+    """UTC ISO timestamp -> local date string (per TZ_OFFSET_HOURS)."""
+    dt = datetime.fromisoformat(ts_iso) + timedelta(hours=TZ_OFFSET_HOURS)
+    return dt.strftime("%Y-%m-%d")
+
+
+def logging_streak(chat_id) -> int:
+    """Consecutive local days (ending today or yesterday) with at least one meal logged."""
+    since = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+    rows = q("SELECT timestamp FROM meals WHERE chat_id = ? AND timestamp >= ?", (str(chat_id), since))
+    days = {local_date(r["timestamp"]) for r in rows}
+    if not days:
+        return 0
+    today = (datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)).date()
+    # anchor: today if logged today, else yesterday (day isn't over yet)
+    anchor = today if today.strftime("%Y-%m-%d") in days else today - timedelta(days=1)
+    streak = 0
+    d = anchor
+    while d.strftime("%Y-%m-%d") in days:
+        streak += 1
+        d -= timedelta(days=1)
+    return streak
+
+
+def protein_today(chat_id) -> float:
+    rows = q("SELECT COALESCE(SUM(protein), 0) AS total FROM meals WHERE chat_id = ? AND timestamp >= ?",
+             (str(chat_id), today_start_iso()))
+    return float(rows[0]["total"])
+
+
+def protein_target(chat_id):
+    weight = latest_weight(chat_id)
+    return int(weight * 1.8) if weight else None
+
+
+def save_progress_photo(chat_id, file_id):
+    x("INSERT INTO progress_photos (chat_id, timestamp, file_id) VALUES (?, ?, ?)",
+      (str(chat_id), now_iso(), file_id))
+
+
+def get_comparison_photo(chat_id, min_days_old=21):
+    """Oldest photo at least min_days_old days older than now, for side-by-side comparison."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=min_days_old)).isoformat()
+    rows = q("SELECT file_id, timestamp FROM progress_photos WHERE chat_id = ? AND timestamp <= ? "
+             "ORDER BY timestamp ASC LIMIT 1", (str(chat_id), cutoff))
+    return rows[0] if rows else None
+
+
+def send_photo(chat_id, file_id, caption=""):
+    requests.post(f"{TELEGRAM_API}/sendPhoto",
+                  data={"chat_id": chat_id, "photo": file_id, "caption": caption})
+
+
+def remove_buttons(chat_id, message_id):
+    """Strip inline buttons off an old message so it can't be double-tapped."""
+    requests.post(f"{TELEGRAM_API}/editMessageReplyMarkup",
+                  data={"chat_id": chat_id, "message_id": message_id,
+                        "reply_markup": json.dumps({"inline_keyboard": []})})
 
 
 def save_profile(chat_id, **kwargs):
@@ -481,49 +502,80 @@ def save_profile(chat_id, **kwargs):
         "sex": kwargs.get("sex", existing.get("sex")),
         "activity": kwargs.get("activity", existing.get("activity")),
     }
-    conn = db()
-    conn.execute(
-        "INSERT INTO profiles (chat_id, name, age, height_cm, start_weight_kg, sex, activity) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET name=excluded.name, age=excluded.age, "
-        "height_cm=excluded.height_cm, start_weight_kg=excluded.start_weight_kg, "
-        "sex=excluded.sex, activity=excluded.activity",
-        (str(chat_id), merged["name"], merged["age"], merged["height_cm"], merged["start_weight_kg"],
-         merged["sex"], merged["activity"]),
-    )
-    conn.commit()
-    conn.close()
+    x("INSERT INTO profiles (chat_id, name, age, height_cm, start_weight_kg, sex, activity) "
+      "VALUES (?, ?, ?, ?, ?, ?, ?) "
+      "ON CONFLICT(chat_id) DO UPDATE SET name=excluded.name, age=excluded.age, "
+      "height_cm=excluded.height_cm, start_weight_kg=excluded.start_weight_kg, "
+      "sex=excluded.sex, activity=excluded.activity",
+      (str(chat_id), merged["name"], merged["age"], merged["height_cm"], merged["start_weight_kg"],
+       merged["sex"], merged["activity"]))
 
 
-# ---------- CALORIE TARGETS (Mifflin-St Jeor) ----------
+def all_profiles():
+    return q("SELECT * FROM profiles ORDER BY name")
+
+
+def reset_user_data(chat_id):
+    for table in ("meals", "workouts", "weights", "water", "profiles", "states", "progress_photos"):
+        x(f"DELETE FROM {table} WHERE chat_id = ?", (str(chat_id),))
+
+
+# ---------- CALORIE TARGETS (Mifflin-St Jeor formula + adaptive from real data) ----------
+def _estimated_tdee_from_data(chat_id):
+    """Measured maintenance: avg intake minus energy equivalent of weight change.
+    Returns None unless there's enough data to trust (≥14 days weight span, ≥7 logged days)."""
+    month_ago = (datetime.now(timezone.utc) - timedelta(days=35)).isoformat()
+    weights = q("SELECT weight_kg, timestamp FROM weights WHERE chat_id = ? AND timestamp >= ? ORDER BY timestamp",
+                (str(chat_id), month_ago))
+    meals = q("SELECT calories, timestamp FROM meals WHERE chat_id = ? AND timestamp >= ?",
+              (str(chat_id), month_ago))
+    if len(weights) < 4 or not meals:
+        return None
+    days = (datetime.fromisoformat(weights[-1]["timestamp"]) -
+            datetime.fromisoformat(weights[0]["timestamp"])).days
+    meal_days = len({local_date(m["timestamp"]) for m in meals})
+    if days < 14 or meal_days < 7:
+        return None
+    # smooth endpoints: average first 3 and last 3 weigh-ins to cut water-weight noise
+    first_avg = sum(w["weight_kg"] for w in weights[:3]) / len(weights[:3])
+    last_avg = sum(w["weight_kg"] for w in weights[-3:]) / len(weights[-3:])
+    weight_change = last_avg - first_avg
+    avg_intake = sum(m["calories"] for m in meals) / meal_days
+    return avg_intake - (weight_change * 7700 / days)
+
+
 def compute_targets(chat_id):
-    """Returns (maintenance_kcal, deficit_target_kcal, water_target_ml) or (None, None, water) if profile incomplete."""
     profile = get_profile(chat_id)
     weight = latest_weight(chat_id) or (profile or {}).get("start_weight_kg")
-
     water_target = int(weight * WATER_ML_PER_KG) if weight else DEFAULT_WATER_TARGET_ML
-
     if not profile or not all([profile.get("age"), profile.get("height_cm"), weight,
                                profile.get("sex"), profile.get("activity")]):
         return None, None, water_target
-
     bmr = 10 * weight + 6.25 * profile["height_cm"] - 5 * profile["age"]
     bmr += 5 if profile["sex"] == "m" else -161
-    maintenance = int(bmr * profile["activity"])
+    formula_maintenance = int(bmr * profile["activity"])
+
+    # Adaptive: trust measured data when available, capped to ±25% of formula
+    # (guards against garbage from incomplete logging)
+    maintenance = formula_maintenance
+    est = _estimated_tdee_from_data(chat_id)
+    if est:
+        lo, hi = formula_maintenance * 0.75, formula_maintenance * 1.25
+        maintenance = int(min(max(est, lo), hi))
+
     deficit_target = max(maintenance - DEFICIT_KCAL, MIN_TARGET_KCAL)
     return maintenance, deficit_target, water_target
 
 
-# ---------- REPORTS (all take a chat_id so demo can fire them at the tester) ----------
-def send_daily_report(chat_id):
-    conn = db()
-    meals = conn.execute(
-        "SELECT food_type, food, calories, carbs, protein, fat FROM meals "
-        "WHERE chat_id = ? AND timestamp >= ? ORDER BY timestamp",
-        (str(chat_id), today_start_iso()),
-    ).fetchall()
-    conn.close()
+def targets_are_adaptive(chat_id) -> bool:
+    return _estimated_tdee_from_data(chat_id) is not None
 
+
+# ---------- REPORTS ----------
+def send_daily_report(chat_id):
+    meals = q("SELECT food_type, food, calories, carbs, protein, fat FROM meals "
+              "WHERE chat_id = ? AND timestamp >= ? ORDER BY timestamp",
+              (str(chat_id), today_start_iso()))
     maintenance, deficit_target, _ = compute_targets(chat_id)
 
     if not meals:
@@ -531,32 +583,36 @@ def send_daily_report(chat_id):
         return
 
     total_cal = sum(m["calories"] for m in meals)
-    food_lines = "\n".join(
-        f"- {m['food_type']}: {m['food']} ({m['calories']:.0f} kcal)" for m in meals
-    )
+    food_lines = "\n".join(f"- {m['food_type']}: {m['food']} ({m['calories']:.0f} kcal)" for m in meals)
+    streak = logging_streak(chat_id)
+    p_now = protein_today(chat_id)
+    p_target = protein_target(chat_id)
 
     target_line = ""
     if deficit_target:
         status = "under" if total_cal <= deficit_target else "over"
-        target_line = (
-            f"Deficit target: {deficit_target} kcal (maintenance ≈ {maintenance} kcal). "
-            f"You are {abs(total_cal - deficit_target):.0f} kcal {status} target.\n"
-        )
+        target_line = (f"Deficit target: {deficit_target} kcal (maintenance ≈ {maintenance} kcal). "
+                       f"You are {abs(total_cal - deficit_target):.0f} kcal {status} target.\n")
+
+    protein_line = f"Protein today: {p_now:.0f}g of ~{p_target}g target.\n" if p_target else ""
+    caveat = ("NOTE: only {} item(s) logged today — if meals were skipped in logging, the totals "
+              "understate reality; say so.\n".format(len(meals))) if len(meals) < 2 else ""
 
     prompt = (
         f"{PERSONA_STYLE}"
         "Here is today's food log for someone whose goal is visible, defined abs:\n"
         f"{food_lines}\n"
-        f"Total: {total_cal:.0f} kcal. {target_line}"
+        f"Total: {total_cal:.0f} kcal. {target_line}{protein_line}{caveat}"
         "Write a short end-of-day report (max 120 words): first, flag which specific logged items "
         "work AGAINST the abs goal (calorie-dense, sugary, fried, alcohol) and briefly why; "
-        "then note what was good; end with one supportive line for tomorrow. Plain text only."
+        "note the protein gap if there is one; then note what was good; end with one supportive "
+        "line for tomorrow. Plain text only."
     )
     review = call_gemini([{"text": prompt}])
     if not review:
-        review = f"Total today: {total_cal:.0f} kcal.\n{target_line}(Analysis engine unavailable — try the demo again shortly.)"
-
-    send_message(chat_id, f"📋 Daily Report\n\n{review}")
+        review = f"Total today: {total_cal:.0f} kcal.\n{target_line}{protein_line}(Analysis engine unavailable.)"
+    streak_line = f"\n\n🔥 Logging streak: {streak} day{'s' if streak != 1 else ''}" if streak >= 2 else ""
+    send_message(chat_id, f"📋 Daily Report\n\n{review}{streak_line}")
 
 
 def send_water_reminder(chat_id):
@@ -564,33 +620,23 @@ def send_water_reminder(chat_id):
     drunk = water_today(chat_id)
     remaining = max(water_target - drunk, 0)
     if remaining == 0:
-        text = f"💧 Hydration complete, sir — {drunk} ml down, target of {water_target} ml met. Carry on."
-        send_message(chat_id, text)
+        send_message(chat_id, f"💧 Hydration complete, sir — {drunk} ml down, target of {water_target} ml met.")
         return
-    text = (
-        f"💧 Hydration check, sir. Progress: {drunk} / {water_target} ml today.\n"
-        f"I'd suggest ~500 ml now — {remaining} ml to go."
-    )
-    send_message(chat_id, text, buttons=[{"text": "💧 +500 ml", "callback_data": "water_500"},
-                                         {"text": "+250 ml", "callback_data": "water_250"}])
+    send_message(chat_id,
+                 f"💧 Hydration check, sir. Progress: {drunk} / {water_target} ml today.\n"
+                 f"I'd suggest ~500 ml now — {remaining} ml to go.",
+                 buttons=[{"text": "💧 +500 ml", "callback_data": "water_500"},
+                          {"text": "+250 ml", "callback_data": "water_250"}])
 
 
 def send_weekly_report(chat_id):
-    conn = db()
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-    meals = conn.execute(
-        "SELECT calories, carbs, protein, fat FROM meals WHERE chat_id = ? AND timestamp >= ?",
-        (str(chat_id), week_ago),
-    ).fetchall()
-    workouts = conn.execute(
-        "SELECT duration, target FROM workouts WHERE chat_id = ? AND timestamp >= ? AND duration != ''",
-        (str(chat_id), week_ago),
-    ).fetchall()
-    weights = conn.execute(
-        "SELECT weight_kg, timestamp FROM weights WHERE chat_id = ? AND timestamp >= ? ORDER BY timestamp",
-        (str(chat_id), week_ago),
-    ).fetchall()
-    conn.close()
+    meals = q("SELECT calories, carbs, protein, fat FROM meals WHERE chat_id = ? AND timestamp >= ?",
+              (str(chat_id), week_ago))
+    workouts = q("SELECT duration, target FROM workouts WHERE chat_id = ? AND timestamp >= ? AND duration != ''",
+                 (str(chat_id), week_ago))
+    weights = q("SELECT weight_kg, timestamp FROM weights WHERE chat_id = ? AND timestamp >= ? ORDER BY timestamp",
+                (str(chat_id), week_ago))
 
     total_cal = sum(m["calories"] for m in meals)
     total_carbs = sum(m["carbs"] for m in meals)
@@ -599,127 +645,56 @@ def send_weekly_report(chat_id):
 
     weight_line = ""
     if len(weights) >= 2:
-        change = weights[-1]["weight_kg"] - weights[0]["weight_kg"]
-        weight_line = f"Weight change this week: {'+' if change >= 0 else ''}{change:.1f} kg\n"
+        # Smooth against water-weight noise: average up to first 3 vs last 3 weigh-ins
+        first_avg = sum(w["weight_kg"] for w in weights[:3]) / len(weights[:3])
+        last_avg = sum(w["weight_kg"] for w in weights[-3:]) / len(weights[-3:])
+        change = last_avg - first_avg
+        weight_line = (f"Weight trend this week: {'+' if change >= 0 else ''}{change:.1f} kg "
+                       f"(smoothed — single weigh-ins bounce on water alone)\n")
 
-    text = (
-        "📊 Weekly Report, sir\n"
-        f"Meals logged: {len(meals)}\n"
-        f"Avg daily calories: {total_cal / 7:.0f} kcal\n"
-        f"Avg daily carbs: {total_carbs / 7:.0f}g | Avg protein: {total_protein / 7:.0f}g\n"
-        f"Workouts this week: {workout_days}/7\n"
-        f"{weight_line}"
-    )
-    send_message(chat_id, text)
+    send_message(chat_id,
+                 "📊 Weekly Report, sir\n"
+                 f"Meals logged: {len(meals)}\n"
+                 f"Avg daily calories: {total_cal / 7:.0f} kcal\n"
+                 f"Avg daily carbs: {total_carbs / 7:.0f}g | Avg protein: {total_protein / 7:.0f}g\n"
+                 f"Workouts this week: {workout_days}/7\n"
+                 f"{weight_line}")
 
 
 def send_monthly_report(chat_id):
-    conn = db()
     month_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-    meals = conn.execute(
-        "SELECT food_type, food, calories, carbs, protein, fat, timestamp FROM meals "
-        "WHERE chat_id = ? AND timestamp >= ? ORDER BY timestamp",
-        (str(chat_id), month_ago),
-    ).fetchall()
-    conn.close()
+    meals = q("SELECT food_type, food, calories, carbs, protein, fat, timestamp FROM meals "
+              "WHERE chat_id = ? AND timestamp >= ? ORDER BY timestamp",
+              (str(chat_id), month_ago))
 
     if not meals:
-        send_message(chat_id, "📅 Monthly report, sir: no food logged in the last 30 days. A clean slate, as it were.")
+        send_message(chat_id, "📅 Monthly report, sir: no food logged in the last 30 days.")
         return
 
-    lines = [
-        f"{m['timestamp'][:10]} | {m['food_type']} | {m['food']} | {m['calories']} kcal | "
-        f"{m['carbs']}g carbs | {m['protein']}g protein | {m['fat']}g fat"
-        for m in meals
-    ]
-    data_block = "\n".join(lines)
-
+    lines = [f"{m['timestamp'][:10]} | {m['food_type']} | {m['food']} | {m['calories']} kcal | "
+             f"{m['carbs']}g carbs | {m['protein']}g protein | {m['fat']}g fat" for m in meals]
     prompt = (
         f"{PERSONA_STYLE}"
         "Here is 30 days of the user's food log (one line per item):\n\n"
-        f"{data_block}\n\n"
-        "Write a short monthly eating-habits summary (max 150 words) covering: "
+        + "\n".join(lines) +
+        "\n\nWrite a short monthly eating-habits summary (max 150 words) covering: "
         "average daily calories, the meal/snack/drink balance, most frequently eaten foods, "
-        "notable patterns (high-carb days, low-protein stretches, frequent snacking), "
-        "and one or two practical, supportive suggestions. Plain text only, no markdown."
+        "notable patterns, and one or two practical, supportive suggestions. Plain text only."
     )
     summary = call_gemini([{"text": prompt}])
     if not summary:
-        summary = "The analysis engine is momentarily indisposed, sir. Do try again shortly."
+        summary = "The analysis engine is momentarily indisposed, sir."
     send_message(chat_id, f"📅 Monthly Eating Habits\n\n{summary}")
 
 
-def reset_user_data(chat_id):
-    conn = db()
-    for table in ("meals", "workouts", "weights", "water", "profiles", "states"):
-        conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (str(chat_id),))
-    conn.commit()
-    conn.close()
-
-
-# ---------- HUNGRY: simple meal suggestions ----------
-def calories_today(chat_id) -> float:
-    conn = db()
-    row = conn.execute(
-        "SELECT COALESCE(SUM(calories), 0) AS total FROM meals WHERE chat_id = ? AND timestamp >= ?",
-        (str(chat_id), today_start_iso()),
-    ).fetchone()
-    conn.close()
-    return float(row["total"])
-
-
-def hungry_reply(chat_id, user_text=None) -> str:
-    maintenance, deficit_target, _ = compute_targets(chat_id)
-    eaten = calories_today(chat_id)
-    if deficit_target:
-        budget_line = (
-            f"Today so far: {eaten:.0f} kcal eaten. Daily target: {deficit_target} kcal. "
-            f"Remaining budget: {max(deficit_target - eaten, 0):.0f} kcal."
-        )
-    else:
-        budget_line = f"Today so far: {eaten:.0f} kcal eaten. (No profile yet, so no target — suggest ~500-700 kcal meals.)"
-
-    profile = get_profile(chat_id)
-    weight = latest_weight(chat_id)
-    protein_line = ""
-    if weight:
-        protein_line = f"His daily protein target is roughly {int(weight * 1.8)} g (1.8 g/kg at {weight:.0f} kg). "
-
-    request_line = (
-        f"The user's specific request: \"{user_text}\". " if user_text
-        else "No specific request — offer 2-3 options. "
-    )
-
-    prompt = (
-        f"{PERSONA_STYLE}"
-        "The user is hungry and wants SIMPLE meal ideas that a home cook/house help can prepare with "
-        "everyday ingredients — nothing fancy, max 5-6 ingredients, common pantry items. "
-        f"{budget_line} {protein_line}{request_line}"
-        "Give 2-3 concrete options, each with: name, one-line how-to, approximate kcal and protein grams. "
-        "Prioritize high protein and high satiety within the remaining budget. "
-        "Plain text, max 130 words. End by inviting a follow-up (e.g. 'fancy something else, sir?')."
-    )
-    return call_gemini([{"text": prompt}]) or "The kitchen brain is momentarily offline, sir. Try again shortly."
-
-
-# ---------- BODY INSIGHTS: learn from the data ----------
 def send_body_insights(chat_id):
-    conn = db()
     month_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-    weights = conn.execute(
-        "SELECT weight_kg, timestamp FROM weights WHERE chat_id = ? AND timestamp >= ? ORDER BY timestamp",
-        (str(chat_id), month_ago),
-    ).fetchall()
-    meals = conn.execute(
-        "SELECT calories, protein, timestamp FROM meals WHERE chat_id = ? AND timestamp >= ?",
-        (str(chat_id), month_ago),
-    ).fetchall()
-    workouts = conn.execute(
-        "SELECT duration, target, timestamp FROM workouts WHERE chat_id = ? AND timestamp >= ?",
-        (str(chat_id), month_ago),
-    ).fetchall()
-    conn.close()
-
+    weights = q("SELECT weight_kg, timestamp FROM weights WHERE chat_id = ? AND timestamp >= ? ORDER BY timestamp",
+                (str(chat_id), month_ago))
+    meals = q("SELECT calories, protein, timestamp FROM meals WHERE chat_id = ? AND timestamp >= ?",
+              (str(chat_id), month_ago))
+    workouts = q("SELECT duration, target FROM workouts WHERE chat_id = ? AND timestamp >= ?",
+                 (str(chat_id), month_ago))
     maintenance, deficit_target, _ = compute_targets(chat_id)
 
     if len(weights) < 2 or not meals:
@@ -731,16 +706,10 @@ def send_body_insights(chat_id):
     first_w, last_w = weights[0], weights[-1]
     days = max((datetime.fromisoformat(last_w["timestamp"]) - datetime.fromisoformat(first_w["timestamp"])).days, 1)
     weight_change = last_w["weight_kg"] - first_w["weight_kg"]
-
-    # distinct days with logged food
     meal_days = len({m["timestamp"][:10] for m in meals})
     avg_intake = sum(m["calories"] for m in meals) / max(meal_days, 1)
     avg_protein = sum(m["protein"] for m in meals) / max(meal_days, 1)
-
-    # Estimated ACTUAL maintenance from observed data: intake minus the energy equivalent of weight change
-    # (7700 kcal ≈ 1 kg of body tissue)
     est_tdee = avg_intake - (weight_change * 7700 / days)
-
     workout_count = len([w for w in workouts if w["duration"] and w["duration"] != "0"])
 
     stats = (
@@ -752,14 +721,13 @@ def send_body_insights(chat_id):
         f"(Formula estimate was ~{maintenance} kcal)\n"
         f"Workouts logged: {workout_count}\n"
     )
-
     prompt = (
         f"{PERSONA_STYLE}"
         f"Here are the user's measured body statistics:\n{stats}\n"
         "Explain in max 130 words what this data says about HIS body specifically: "
-        "how his real-world maintenance compares to the formula, whether his current pace of change is "
-        "sensible for revealing abs (~0.5% bodyweight/week is the sustainable benchmark), whether his protein "
-        "is sufficient for muscle retention, and ONE concrete adjustment. Plain text, concrete numbers."
+        "how his real-world maintenance compares to the formula, whether his pace of change is sensible "
+        "for revealing abs (~0.5% bodyweight/week benchmark), whether protein is sufficient for muscle "
+        "retention, and ONE concrete adjustment. Plain text, concrete numbers."
     )
     analysis = call_gemini([{"text": prompt}])
     if not analysis:
@@ -767,20 +735,33 @@ def send_body_insights(chat_id):
     send_message(chat_id, f"🧠 Body Insights\n\n{stats}\n{analysis}")
 
 
-# ---------- VOICE NOTES: log meals/workouts by speaking ----------
-VOICE_EXTRACT_PROMPT = (
-    "Listen to this voice note. The speaker is reporting either food they ate, a workout they did, or both. "
-    "Extract the information and respond ONLY with valid JSON, no other text, no markdown fences:\n"
-    '{"items": [\n'
-    '  {"kind": "food", "food_type": "meal|snack|drink", "food": "description", '
-    '"calories": number, "carbs": number, "protein": number, "fat": number, "confidence": "low|medium|high"},\n'
-    '  {"kind": "workout", "duration": "minutes as string", "target": "Abs|Full body|Cardio|Rest day"}\n'
-    "]}\n"
-    "Include one entry per distinct thing mentioned. Estimate nutrition from the description. "
-    'If the audio contains neither food nor workout info, return {"items": []}.'
-)
+# ---------- HUNGRY ----------
+def hungry_reply(chat_id, user_text=None) -> str:
+    maintenance, deficit_target, _ = compute_targets(chat_id)
+    eaten = calories_today(chat_id)
+    if deficit_target:
+        budget_line = (f"Today so far: {eaten:.0f} kcal eaten. Daily target: {deficit_target} kcal. "
+                       f"Remaining budget: {max(deficit_target - eaten, 0):.0f} kcal.")
+    else:
+        budget_line = f"Today so far: {eaten:.0f} kcal eaten. (No profile — suggest ~500-700 kcal meals.)"
+
+    weight = latest_weight(chat_id)
+    protein_line = f"His daily protein target is roughly {int(weight * 1.8)} g (1.8 g/kg). " if weight else ""
+    request_line = (f"The user's specific request: \"{user_text}\". " if user_text
+                    else "No specific request — offer 2-3 options. ")
+    prompt = (
+        f"{PERSONA_STYLE}"
+        "The user is hungry and wants SIMPLE meal ideas that a home cook/house help can prepare with "
+        "everyday ingredients — nothing fancy, max 5-6 ingredients. "
+        f"{budget_line} {protein_line}{request_line}"
+        "Give 2-3 concrete options, each with: name, one-line how-to, approximate kcal and protein grams. "
+        "Prioritize high protein and high satiety within the remaining budget. "
+        "Plain text, max 130 words. End by inviting a follow-up."
+    )
+    return call_gemini([{"text": prompt}]) or "The kitchen brain is momentarily offline, sir."
 
 
+# ---------- VOICE ----------
 def process_voice_note(chat_id, audio_bytes, mime_type):
     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
     raw = call_gemini([
@@ -792,15 +773,13 @@ def process_voice_note(chat_id, audio_bytes, mime_type):
         return
     raw = raw.strip().removeprefix("```json").removesuffix("```").strip()
     try:
-        data = json.loads(raw)
-        items = data.get("items", [])
+        items = json.loads(raw).get("items", [])
     except json.JSONDecodeError:
         send_message(chat_id, "I heard you, sir, but couldn't structure it. Try stating it plainly, e.g. "
                               "\"I had two eggs and toast, and did 30 minutes of abs.\"")
         return
-
     if not items:
-        send_message(chat_id, "Nothing loggable detected in that note, sir. Mention what you ate or how you trained.")
+        send_message(chat_id, "Nothing loggable detected in that note, sir.")
         return
 
     replies = []
@@ -819,17 +798,62 @@ def process_voice_note(chat_id, audio_bytes, mime_type):
             replies.append(f"💪 workout: {item.get('duration', '?')} min, {item.get('target', '?')}")
 
     send_message(chat_id, "Logged from your voice note, sir:\n" + "\n".join(replies) +
-                          "\n\n(If any food estimate is off, reply with a correction.)")
+                          "\n\n(If any estimate is off, reply with a correction.)")
 
 
-# ---------- MENU ----------
+# ---------- ADMIN ----------
+def show_admin_user_list(chat_id):
+    profiles = all_profiles()
+    if not profiles:
+        send_message(chat_id, "No registered users yet.")
+        return
+    rows, row = [], []
+    for p in profiles:
+        label = p.get("name") or p["chat_id"]
+        row.append({"text": f"👤 {label}", "callback_data": f"admin_view_{p['chat_id']}"})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    send_message(chat_id, "🔑 Admin — registered users:", button_rows=rows)
+
+
+def show_admin_user_detail(admin_chat_id, target_chat_id):
+    profile = get_profile(target_chat_id)
+    name = (profile or {}).get("name") or target_chat_id
+    meals_today = q("SELECT food_type, food, calories FROM meals WHERE chat_id = ? AND timestamp >= ?",
+                    (str(target_chat_id), today_start_iso()))
+    weight = latest_weight(target_chat_id) or (profile or {}).get("start_weight_kg")
+    maintenance, deficit_target, water_target = compute_targets(target_chat_id)
+    drunk = water_today(target_chat_id)
+
+    lines = [f"📋 {name}'s Day\n"]
+    if profile:
+        lines.append(f"Age {profile.get('age', '—')} | {weight or '—'} kg | {profile.get('height_cm', '—')} cm")
+    if maintenance:
+        lines.append(f"Target: ~{deficit_target} kcal | Maintenance: ~{maintenance} kcal")
+    lines.append(f"Water: {drunk} / {water_target} ml today\n")
+    if meals_today:
+        lines.append("Today's food:")
+        total = 0
+        for m in meals_today:
+            lines.append(f"- {m['food_type']}: {m['food']} ({m['calories']:.0f} kcal)")
+            total += m["calories"]
+        lines.append(f"\nTotal: {total:.0f} kcal")
+    else:
+        lines.append("Nothing logged today yet.")
+    send_message(admin_chat_id, "\n".join(lines),
+                 buttons=[{"text": "⬅️ Back to list", "callback_data": "admin_list"}])
+
+
+# ---------- MENU / PROFILE / CHAT ----------
 def show_menu(chat_id):
     profile = get_profile(chat_id)
     name = (profile or {}).get("name")
     greeting = f"At your service, {name}. What shall it be?" if name else MENU_TEXT
     send_message(chat_id, greeting,
                  button_rows=[MENU_BUTTONS, MENU_BUTTONS_ROW2, MENU_BUTTONS_ROW3, MENU_BUTTONS_ROW4])
-    # Attach the persistent big-button keyboard (sent separately since inline + reply can't share one message)
     send_message(chat_id, "Quick actions below ⬇️", with_keyboard=True)
 
 
@@ -851,20 +875,20 @@ def show_profile(chat_id):
         f"Sex: {sex_label} | Activity: {act_label}\n"
     )
     if maintenance:
-        text += (
-            f"\n🔢 Maintenance: ~{maintenance} kcal | Target: ~{deficit_target} kcal\n"
-            f"💧 Water target: ~{water_target} ml/day"
-        )
+        adaptive_tag = " (adaptive — measured from your own data)" if targets_are_adaptive(chat_id) else " (formula estimate)"
+        text += (f"\n🔢 Maintenance: ~{maintenance} kcal{adaptive_tag}\n"
+                 f"🎯 Target: ~{deficit_target} kcal\n"
+                 f"💧 Water target: ~{water_target} ml/day")
     send_message(chat_id, text, button_rows=[
         [{"text": "✏️ Name", "callback_data": "edit_name"},
          {"text": "✏️ Age", "callback_data": "edit_age"},
          {"text": "✏️ Height", "callback_data": "edit_height"}],
         [{"text": "✏️ Activity", "callback_data": "edit_activity"},
-         {"text": "🔄 Redo full setup", "callback_data": "edit_full"}],
+         {"text": "📸 Progress photo", "callback_data": "progress_photo"}],
+        [{"text": "🔄 Redo full setup", "callback_data": "edit_full"}],
     ])
 
 
-# ---------- CONVERSATIONAL FALLBACK ----------
 def chat_reply(chat_id, text) -> str:
     profile = get_profile(chat_id) or {}
     maintenance, deficit_target, water_target = compute_targets(chat_id)
@@ -897,10 +921,8 @@ def webhook():
         chat_id = update["message"]["chat"]["id"]
         try:
             media = update["message"].get("voice") or update["message"].get("audio")
-            file_id = media["file_id"]
-            mime_type = media.get("mime_type", "audio/ogg")
-            audio_bytes, _ = download_telegram_photo(file_id)  # same download mechanism works for any file
-            process_voice_note(chat_id, audio_bytes, mime_type)
+            audio_bytes = download_telegram_file(media["file_id"])
+            process_voice_note(chat_id, audio_bytes, media.get("mime_type", "audio/ogg"))
         except Exception as e:
             print(f"VOICE HANDLING FAILED: {type(e).__name__}: {e}", flush=True)
             send_message(chat_id, f"My apologies, sir — that voice note defeated me: {e}")
@@ -911,10 +933,22 @@ def webhook():
         chat_id = update["message"]["chat"]["id"]
         try:
             state = get_state(chat_id)
-            food_type = state.get("pending_food_type") or "meal"
             file_id = update["message"]["photo"][-1]["file_id"]
-            image_bytes, mime_type = download_telegram_photo(file_id)
-            result = analyze_food_image(image_bytes, mime_type)
+
+            # Progress photo mode (after the weekly prompt or 📸 button)
+            if state.get("state") == "awaiting_progress_photo":
+                save_progress_photo(chat_id, file_id)
+                set_state(chat_id, state="")
+                old = get_comparison_photo(chat_id)
+                send_message(chat_id, "📸 Progress photo saved, sir. The mirror never lies — but it does take a few weeks to speak up.")
+                if old and old["file_id"] != file_id:
+                    send_photo(chat_id, old["file_id"],
+                               caption=f"For comparison, sir — you on {local_date(old['timestamp'])}.")
+                return jsonify(ok=True)
+
+            food_type = state.get("pending_food_type") or "meal"
+            image_bytes = download_telegram_file(file_id)
+            result = analyze_food_image(image_bytes, "image/jpeg")
             print(f"Gemini result: {result}", flush=True)
             meal_id = log_meal(chat_id, food_type, result)
             set_state(chat_id, state="can_correct", pending_food_type="", last_meal_id=meal_id)
@@ -932,6 +966,22 @@ def webhook():
 
         if text.lower() in {"/myid", "myid"}:
             send_message(chat_id, f"Your chat ID, sir: {chat_id}")
+            return jsonify(ok=True)
+
+        if text.lower() in {"/admin", "admin"}:
+            if ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID):
+                show_admin_user_list(chat_id)
+            else:
+                send_message(chat_id, "Not authorized for that, sir.")
+            return jsonify(ok=True)
+
+        if text.lower() in {"/undo", "undo"}:
+            removed = delete_last_meal(chat_id)
+            if removed:
+                set_state(chat_id, state="", last_meal_id=0)
+                send_message(chat_id, f"🗑 Removed: {removed}. As if it never happened, sir.")
+            else:
+                send_message(chat_id, "Nothing to undo, sir.")
             return jsonify(ok=True)
 
         # Persistent keyboard quick actions
@@ -964,29 +1014,12 @@ def webhook():
             show_menu(chat_id)
             return jsonify(ok=True)
 
-        if state.get("state") == "awaiting_weight":
-            try:
-                weight = float(text.replace(",", "."))
-                log_weight(chat_id, weight)
-                profile = get_profile(chat_id)
-                if profile and profile.get("start_weight_kg"):
-                    diff = weight - profile["start_weight_kg"]
-                    trend = f" ({'+' if diff >= 0 else ''}{diff:.1f} kg since start)"
-                else:
-                    trend = ""
-                set_state(chat_id, state="")
-                send_message(chat_id, f"Weight logged, sir: {weight:.1f} kg{trend} ✅")
-            except ValueError:
-                send_message(chat_id, "Just the number please, sir — e.g. 72.5")
-            return jsonify(ok=True)
-
         if state.get("state") == "awaiting_name":
             save_profile(chat_id, name=text[:40])
             set_state(chat_id, state="awaiting_age")
             send_message(chat_id, f"A pleasure, {text[:40]}. How old are you?")
             return jsonify(ok=True)
 
-        # Single-field edits from the profile screen
         if state.get("state") == "edit_name":
             save_profile(chat_id, name=text[:40])
             set_state(chat_id, state="")
@@ -1011,8 +1044,7 @@ def webhook():
 
         if state.get("state") == "awaiting_age":
             try:
-                age = int(text)
-                save_profile(chat_id, age=age)
+                save_profile(chat_id, age=int(text))
                 set_state(chat_id, state="awaiting_height")
                 send_message(chat_id, "Noted. And your height in cm, sir?")
             except ValueError:
@@ -1021,8 +1053,7 @@ def webhook():
 
         if state.get("state") == "awaiting_height":
             try:
-                height = float(text.replace(",", "."))
-                save_profile(chat_id, height_cm=height)
+                save_profile(chat_id, height_cm=float(text.replace(",", ".")))
                 set_state(chat_id, state="awaiting_start_weight")
                 send_message(chat_id, "Very good. Current weight in kg? (Just the number.)")
             except ValueError:
@@ -1036,32 +1067,45 @@ def webhook():
                 log_weight(chat_id, weight)
                 set_state(chat_id, state="")
                 send_message(chat_id, "And your biological sex? (Needed for the calorie mathematics.)",
-                             buttons=SEX_BUTTONS)
+                             buttons=[{"text": "Male", "callback_data": "sex_m"},
+                                      {"text": "Female", "callback_data": "sex_f"}])
             except ValueError:
                 send_message(chat_id, "Just the number please, sir — e.g. 72.5")
             return jsonify(ok=True)
 
-        # Hungry chat: follow-up requests for meal ideas
+        if state.get("state") == "awaiting_weight":
+            try:
+                weight = float(text.replace(",", "."))
+                log_weight(chat_id, weight)
+                profile = get_profile(chat_id)
+                if profile and profile.get("start_weight_kg"):
+                    diff = weight - profile["start_weight_kg"]
+                    trend = f" ({'+' if diff >= 0 else ''}{diff:.1f} kg since start)"
+                else:
+                    trend = ""
+                set_state(chat_id, state="")
+                send_message(chat_id, f"Weight logged, sir: {weight:.1f} kg{trend} ✅")
+            except ValueError:
+                send_message(chat_id, "Just the number please, sir — e.g. 72.5")
+            return jsonify(ok=True)
+
         if state.get("state") == "hungry_chat":
-            reply = hungry_reply(chat_id, user_text=text)
-            send_message(chat_id, reply)
+            send_message(chat_id, hungry_reply(chat_id, user_text=text))
             return jsonify(ok=True)
 
         if state.get("state") == "can_correct" and state.get("last_meal_id"):
-            conn = db()
-            row = conn.execute("SELECT * FROM meals WHERE id = ?", (state["last_meal_id"],)).fetchone()
-            conn.close()
-            if row:
+            rows = q("SELECT * FROM meals WHERE id = ?", (state["last_meal_id"],))
+            if rows:
+                row = rows[0]
                 original = {"food": row["food"], "calories": row["calories"], "carbs": row["carbs"],
                             "protein": row["protein"], "fat": row["fat"], "confidence": row["confidence"]}
                 revised = reanalyze_with_correction(original, text)
                 update_meal(state["last_meal_id"], revised)
                 send_message(chat_id, "Amended, sir ✅\n" + format_food_reply(revised, row["food_type"]))
             else:
-                send_message(chat_id, "I couldn't locate the last entry to amend, sir. Send 'menu' to start over.")
+                send_message(chat_id, "I couldn't locate the last entry to amend, sir.")
             return jsonify(ok=True)
 
-        # Conversational fallback — chat naturally instead of a canned line
         send_message(chat_id, chat_reply(chat_id, text))
         return jsonify(ok=True)
 
@@ -1069,8 +1113,17 @@ def webhook():
     if "callback_query" in update:
         cq = update["callback_query"]
         chat_id = cq["message"]["chat"]["id"]
+        message_id = cq["message"]["message_id"]
         data = cq["data"]
         answer_callback(cq["id"])
+
+        # One-shot buttons: remove them after the tap so old messages can't double-log
+        one_shot_prefixes = ("water_", "dur_", "tgt_", "int_", "ft_", "sex_", "act_", "demo_reset")
+        if data.startswith(one_shot_prefixes):
+            try:
+                remove_buttons(chat_id, message_id)
+            except Exception:
+                pass
 
         if data == "menu_food":
             send_message(chat_id, FOOD_TYPE_TEXT, buttons=FOOD_TYPE_BUTTONS)
@@ -1092,10 +1145,16 @@ def webhook():
             send_message(chat_id, "Your height in cm?")
         elif data == "edit_activity":
             send_message(chat_id, "How active are you day to day, sir?",
-                         button_rows=[ACTIVITY_BUTTONS, ACTIVITY_BUTTONS_ROW2])
+                         button_rows=[[{"text": "Sedentary", "callback_data": "act_1.2"},
+                                       {"text": "Light", "callback_data": "act_1.375"},
+                                       {"text": "Moderate", "callback_data": "act_1.55"}],
+                                      [{"text": "Very active", "callback_data": "act_1.725"}]])
         elif data == "edit_full":
             set_state(chat_id, state="awaiting_name")
             send_message(chat_id, "Full setup then, sir. What shall I call you?")
+        elif data == "progress_photo":
+            set_state(chat_id, state="awaiting_progress_photo")
+            send_message(chat_id, "📸 Send your progress photo, sir — same spot, same lighting each time.")
         elif data == "menu_hungry":
             set_state(chat_id, state="hungry_chat", pending_food_type="")
             send_message(chat_id, "One moment, sir — consulting the pantry and your calorie ledger...")
@@ -1104,11 +1163,17 @@ def webhook():
             send_message(chat_id, "Crunching your numbers, sir...")
             send_body_insights(chat_id)
         elif data == "menu_demo":
-            send_message(chat_id, DEMO_TEXT, button_rows=[DEMO_BUTTONS, DEMO_BUTTONS_ROW2, DEMO_BUTTONS_ROW3])
+            send_message(chat_id, "Testing chamber, sir. Which system shall I fire?",
+                         button_rows=[[{"text": "📋 Daily Report", "callback_data": "demo_daily"},
+                                       {"text": "💧 Water Reminder", "callback_data": "demo_water"}],
+                                      [{"text": "📊 Weekly Report", "callback_data": "demo_weekly"},
+                                       {"text": "📅 Monthly Report", "callback_data": "demo_monthly"}],
+                                      [{"text": "🗑 Reset My Data", "callback_data": "demo_reset"}]])
         elif data.startswith("ft_"):
             food_type = data.replace("ft_", "")
             set_state(chat_id, state="", pending_food_type=food_type)
-            send_message(chat_id, f"Send a photo of your {food_type}, sir 📸")
+            send_message(chat_id, f"Send a photo of your {food_type}, sir 📸\n"
+                                  f"(Tip: include a fork or your hand in frame — it sharpens my portion estimates.)")
         elif data.startswith("dur_"):
             duration = data.replace("dur_", "")
             if duration == "0":
@@ -1138,19 +1203,20 @@ def webhook():
         elif data.startswith("sex_"):
             save_profile(chat_id, sex=data.replace("sex_", ""))
             send_message(chat_id, "And how active are you day to day, sir?",
-                         button_rows=[ACTIVITY_BUTTONS, ACTIVITY_BUTTONS_ROW2])
+                         button_rows=[[{"text": "Sedentary", "callback_data": "act_1.2"},
+                                       {"text": "Light", "callback_data": "act_1.375"},
+                                       {"text": "Moderate", "callback_data": "act_1.55"}],
+                                      [{"text": "Very active", "callback_data": "act_1.725"}]])
         elif data.startswith("act_"):
             save_profile(chat_id, activity=float(data.replace("act_", "")))
             maintenance, deficit_target, water_target = compute_targets(chat_id)
-            send_message(
-                chat_id,
-                f"Profile complete, sir ✅\n\n"
-                f"Estimated maintenance: ~{maintenance} kcal/day\n"
-                f"Recommended target for the abs project: ~{deficit_target} kcal/day "
-                f"(a moderate {DEFICIT_KCAL} kcal deficit — sustainable beats drastic)\n"
-                f"Daily water target: ~{water_target} ml\n\n"
-                f"These are estimates, sir — we'll refine as the weigh-ins come in.",
-            )
+            send_message(chat_id,
+                         f"Profile complete, sir ✅\n\n"
+                         f"Estimated maintenance: ~{maintenance} kcal/day\n"
+                         f"Recommended target for the abs project: ~{deficit_target} kcal/day "
+                         f"(a moderate {DEFICIT_KCAL} kcal deficit — sustainable beats drastic)\n"
+                         f"Daily water target: ~{water_target} ml\n\n"
+                         f"These are estimates, sir — we'll refine as the weigh-ins come in.")
         elif data == "water_500":
             log_water(chat_id, 500)
             _, _, water_target = compute_targets(chat_id)
@@ -1168,8 +1234,7 @@ def webhook():
         elif data == "demo_monthly":
             send_monthly_report(chat_id)
         elif data == "demo_reset":
-            send_message(chat_id, "This erases ALL your logged data, sir — meals, workouts, weights, water, profile. "
-                                  "Quite irreversible. Certain?",
+            send_message(chat_id, "This erases ALL your logged data, sir — quite irreversible. Certain?",
                          buttons=[{"text": "Yes, wipe it", "callback_data": "demo_reset_confirm"},
                                   {"text": "Cancel", "callback_data": "demo_reset_cancel"}])
         elif data == "demo_reset_confirm":
@@ -1177,12 +1242,18 @@ def webhook():
             send_message(chat_id, "Done, sir. A blank slate. Send 'menu' to begin anew.")
         elif data == "demo_reset_cancel":
             send_message(chat_id, "Wise choice, sir. Data intact.")
+        elif data == "admin_list":
+            if ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID):
+                show_admin_user_list(chat_id)
+        elif data.startswith("admin_view_"):
+            if ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID):
+                show_admin_user_detail(chat_id, data.replace("admin_view_", ""))
         return jsonify(ok=True)
 
     return jsonify(ok=True)
 
 
-# ---------- TRIGGERS (cron-job.org) — each fires for ALL registered users ----------
+# ---------- TRIGGERS ----------
 def _for_all_users(fn):
     if not FRIEND_CHAT_IDS:
         return jsonify(status="no chat ids set"), 400
@@ -1196,7 +1267,8 @@ def _for_all_users(fn):
 
 @app.route("/trigger/daily-prompt", methods=["GET", "POST"])
 def trigger_daily_prompt():
-    return _for_all_users(lambda cid: send_message(cid, DAILY_PROMPT_TEXT, buttons=DURATION_OPTIONS))
+    return _for_all_users(lambda cid: send_message(cid, DAILY_PROMPT_TEXT,
+                                                   button_rows=[DURATION_OPTIONS, DURATION_OPTIONS_ROW2]))
 
 
 @app.route("/trigger/daily-report", methods=["GET", "POST"])
@@ -1211,9 +1283,8 @@ def trigger_water_reminder():
 
 def _send_weight_reminder(cid):
     set_state(cid, state="awaiting_weight")
-    send_message(cid,
-                 "⚖️ Morning weigh-in, sir. For consistency: after waking, after the bathroom, "
-                 "before food or drink.\n\nReply with your weight in kg (just the number).")
+    send_message(cid, "⚖️ Morning weigh-in, sir. For consistency: after waking, after the bathroom, "
+                      "before food or drink.\n\nReply with your weight in kg (just the number).")
 
 
 @app.route("/trigger/weight-reminder", methods=["GET", "POST"])
@@ -1231,22 +1302,51 @@ def trigger_monthly_report():
     return _for_all_users(send_monthly_report)
 
 
+def _send_protein_check(cid):
+    p_target = protein_target(cid)
+    if not p_target:
+        return
+    p_now = protein_today(cid)
+    gap = p_target - p_now
+    if gap <= 20:
+        return  # on track, don't nag
+    send_message(cid,
+                 f"🥩 Protein check, sir: {p_now:.0f}g of {p_target}g so far — {gap:.0f}g short with the "
+                 f"evening ahead. A shake (~25g), 200g chicken breast (~45g), or 250g Greek yogurt (~25g) "
+                 f"would close the gap nicely.")
+
+
+@app.route("/trigger/protein-check", methods=["GET", "POST"])
+def trigger_protein_check():
+    return _for_all_users(_send_protein_check)
+
+
+def _send_photo_prompt(cid):
+    set_state(cid, state="awaiting_progress_photo")
+    send_message(cid,
+                 "📸 Weekly progress photo, sir. Same spot, same lighting, relaxed front pose — "
+                 "consistency is what makes the comparison honest. Send it whenever ready.")
+
+
+@app.route("/trigger/photo-prompt", methods=["GET", "POST"])
+def trigger_photo_prompt():
+    return _for_all_users(_send_photo_prompt)
+
+
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify(status="alive"), 200
+    return jsonify(status="alive", db="turso" if USE_TURSO else "sqlite-ephemeral"), 200
 
 
-# ---------- iOS SHORTCUTS ENDPOINTS (direct logging without opening Telegram) ----------
+# ---------- iOS SHORTCUTS ----------
 def _shortcut_auth_ok():
     if not SHORTCUT_TOKEN:
-        return True  # no token configured -> open (set SHORTCUT_TOKEN on Render to lock down)
+        return True
     return request.args.get("token", "") == SHORTCUT_TOKEN or request.form.get("token", "") == SHORTCUT_TOKEN
 
 
 @app.route("/shortcut/water", methods=["GET", "POST"])
 def shortcut_water():
-    """One-tap water logging from an iOS Shortcut.
-    Params: chat_id (required), ml (optional, default 500), token (if SHORTCUT_TOKEN set)."""
     if not _shortcut_auth_ok():
         return "Unauthorized", 401
     chat_id = request.args.get("chat_id") or request.form.get("chat_id")
@@ -1255,15 +1355,11 @@ def shortcut_water():
     ml = int(request.args.get("ml", request.form.get("ml", 500)))
     log_water(chat_id, ml)
     _, _, water_target = compute_targets(chat_id)
-    total = water_today(chat_id)
-    return f"💧 Logged {ml} ml. Today: {total} / {water_target} ml.", 200
+    return f"💧 Logged {ml} ml. Today: {water_today(chat_id)} / {water_target} ml.", 200
 
 
 @app.route("/shortcut/meal", methods=["POST"])
 def shortcut_meal():
-    """Photo meal logging from an iOS Shortcut (Take Photo -> POST here).
-    Form fields: photo (image file, required), chat_id (required),
-    food_type (optional: meal/snack/drink), token (if SHORTCUT_TOKEN set)."""
     if not _shortcut_auth_ok():
         return "Unauthorized", 401
     chat_id = request.args.get("chat_id") or request.form.get("chat_id")
@@ -1272,20 +1368,12 @@ def shortcut_meal():
     if "photo" not in request.files:
         return "Missing photo file (form field name must be 'photo')", 400
     f = request.files["photo"]
-    image_bytes = f.read()
-    mime_type = f.mimetype or "image/jpeg"
-    food_type = request.args.get("food_type", request.form.get("food_type", "meal"))
-
-    result = analyze_food_image(image_bytes, mime_type)
-    meal_id = log_meal(chat_id, food_type, result)
+    result = analyze_food_image(f.read(), f.mimetype or "image/jpeg")
+    meal_id = log_meal(chat_id, request.form.get("food_type", "meal"), result)
     set_state(chat_id, state="can_correct", pending_food_type="", last_meal_id=meal_id)
-
-    return (
-        f"Logged ({food_type}): {result.get('food')}\n"
-        f"{result.get('calories')} kcal | {result.get('carbs')}g C | "
-        f"{result.get('protein')}g P | {result.get('fat')}g F\n"
-        f"Confidence: {result.get('confidence')}"
-    ), 200
+    return (f"Logged: {result.get('food')}\n"
+            f"{result.get('calories')} kcal | {result.get('carbs')}g C | "
+            f"{result.get('protein')}g P | {result.get('fat')}g F", 200)
 
 
 @app.route("/set-webhook", methods=["GET"])
